@@ -8,6 +8,525 @@ import datetime, json, io
 from pathlib import Path
 
 """
+Panel Checker V2 — Analyse directe des fichiers HAM
+Parse les fichiers source et reproduit les calculs du Panel Checker Excel.
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+import numpy as np
+import datetime
+import io
+from openpyxl import load_workbook
+
+# ─── CONSTANTES ───────────────────────────────────────────────────────────────
+
+SITES_ORDER = [
+    'AvendreAlouer', "Bien'ici", 'Figaro Immo', 'Green-Acres',
+    'Leboncoin', 'LogicImmo', 'MeilleursAgents', 'OuestFrance',
+    'PAP', 'ParuVendu', 'SeLoger', 'SuperImmo'
+]
+
+SITES_COLORS = {
+    'AvendreAlouer': '#27CCC3',
+    "Bien'ici": '#FFC000',
+    'Figaro Immo': '#E80536',
+    'Green-Acres': '#84A824',
+    'Leboncoin': '#FC6E2B',
+    'LogicImmo': '#000000',
+    'MeilleursAgents': '#1E91FF',
+    'OuestFrance': '#E1000F',
+    'PAP': '#1A48DC',
+    'ParuVendu': '#242021',
+    'SeLoger': '#E6103E',
+    'SuperImmo': '#FB2375',
+}
+
+SKIP_ROWS = {
+    'Total', 'Total Panel Dédupliqué', 'Total Panel Dédupliqué - Top 5 Sites',
+    'Total Panel Dédupliqué  - Top 11 Sites', 'Total Panel Dédupliqué Marché',
+    'Total Panel Dédupliq', 'Immobilier Notaire', 'Immonot', 'Site',
+    'Totaux', 'Intro', 'Total Panel Dedup',
+}
+
+# ─── PARSING ──────────────────────────────────────────────────────────────────
+
+def excel_date_str(v):
+    if isinstance(v, datetime.datetime):
+        return v.strftime('%b-%y')
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, (int, float)) and 40000 < v < 50000:
+        return (datetime.datetime(1899, 12, 30) + datetime.timedelta(days=int(v))).strftime('%b-%y')
+    return str(v)
+
+def parse_ham_file(file_bytes, filename):
+    """Parse un fichier HAM et retourne les sections avec données mensuelles."""
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    result = {}
+    
+    for sn in wb.sheetnames:
+        if sn == 'Intro':
+            continue
+        ws = wb[sn]
+        
+        # Find Site header rows
+        for r in range(1, ws.max_row + 1):
+            b = ws.cell(r, 2).value
+            if b != 'Site' and b != 'Département':
+                continue
+            
+            # Get month columns
+            month_cols = []
+            months = []
+            for c in range(3, ws.max_column + 1):
+                v = ws.cell(r, c).value
+                if v is None:
+                    continue
+                s = excel_date_str(v)
+                if (isinstance(v, datetime.datetime) or
+                    (isinstance(v, (int, float)) and 40000 < v < 50000) or
+                    (isinstance(v, str) and any(m in v.lower() for m in
+                     ['-25', '-26', '-24', 'avr', 'mars', 'mai', 'juin',
+                      'juil', 'août', 'sep', 'oct', 'nov', 'dec', 'jan', 'fev']))):
+                    month_cols.append(c)
+                    months.append(s)
+            
+            if len(months) < 2:
+                continue
+            
+            # Get section label
+            label = None
+            for tr in range(r - 1, max(0, r - 5), -1):
+                v = ws.cell(tr, 2).value
+                if v and isinstance(v, str) and len(v.strip()) > 3 and v.strip() != 'Site':
+                    label = v.strip()
+                    break
+            if not label:
+                label = sn
+            
+            # Extract site data
+            sites = {}
+            for dr in range(r + 1, min(r + 30, ws.max_row + 1)):
+                site = ws.cell(dr, 2).value
+                if not site or not isinstance(site, str):
+                    break
+                site = site.strip()
+                if site in SKIP_ROWS or site == '' or site == 'Site':
+                    if site == 'Site':
+                        break
+                    continue
+                
+                vals = []
+                for c in month_cols:
+                    v = ws.cell(dr, c).value
+                    if isinstance(v, (int, float)):
+                        vals.append(float(v))
+                    else:
+                        vals.append(None)
+                
+                real = [v for v in vals if v is not None and v > 0]
+                if len(real) >= 2:
+                    sites[site] = vals
+            
+            # Also get totals
+            total_data = {}
+            for dr in range(r + 1, min(r + 40, ws.max_row + 1)):
+                site = ws.cell(dr, 2).value
+                if not site or not isinstance(site, str):
+                    break
+                site = site.strip()
+                if 'Total Panel' in site or site == 'Total':
+                    vals = []
+                    for c in month_cols:
+                        v = ws.cell(dr, c).value
+                        vals.append(float(v) if isinstance(v, (int, float)) else None)
+                    total_data[site] = vals
+            
+            if sites:
+                key = f"{sn}__r{r}"
+                result[key] = {
+                    'sheet': sn,
+                    'label': label,
+                    'months': months,
+                    'sites': sites,
+                    'totals': total_data,
+                    'file': filename,
+                }
+    
+    return result
+
+# ─── CALCULS PANEL CHECKER ───────────────────────────────────────────────────
+
+def compute_metrics(sites_data, totals_data, months):
+    """
+    Calcule pour chaque site:
+    - Valeur M (dernier mois)
+    - Valeur M-1 
+    - Evol% = (M - M-1) / M-1
+    - Part de Réseau M = site / total_dedup
+    - Part de Réseau M-1
+    - Market Share Evol (pp) = PR_M - PR_M-1
+    """
+    results = []
+    
+    # Find total dédupliqué
+    total_dedup_m = None
+    total_dedup_m1 = None
+    for k, v in totals_data.items():
+        if 'Dédupliqué' in k or 'Dedup' in k:
+            real = [(i, x) for i, x in enumerate(v) if x is not None and x > 0]
+            if len(real) >= 2:
+                total_dedup_m = real[-1][1]
+                total_dedup_m1 = real[-2][1]
+                break
+    
+    # Total simple
+    total_m = total_m1 = None
+    if 'Total' in totals_data:
+        real = [(i, x) for i, x in enumerate(totals_data['Total']) if x is not None and x > 0]
+        if len(real) >= 2:
+            total_m = real[-1][1]
+            total_m1 = real[-2][1]
+    
+    for site_name, vals in sites_data.items():
+        real_pairs = [(i, v) for i, v in enumerate(vals) if v is not None and v > 0]
+        if len(real_pairs) < 2:
+            continue
+        
+        last_i, last_v = real_pairs[-1]
+        prev_i, prev_v = real_pairs[-2]
+        
+        month_m = months[last_i] if last_i < len(months) else '?'
+        month_m1 = months[prev_i] if prev_i < len(months) else '?'
+        
+        evol_pct = (last_v / prev_v - 1) * 100 if prev_v > 0 else None
+        
+        pr_m = (last_v / total_dedup_m * 100) if total_dedup_m and total_dedup_m > 0 else None
+        pr_m1 = (prev_v / total_dedup_m1 * 100) if total_dedup_m1 and total_dedup_m1 > 0 else None
+        evol_pr = (pr_m - pr_m1) if pr_m is not None and pr_m1 is not None else None
+        
+        # Anomaly detection
+        anomalies = []
+        max_hist = max((v for v in vals[:-1] if v is not None and v > 5), default=None)
+        
+        if evol_pct is not None:
+            if evol_pct <= -20:
+                anomalies.append(('critical', f'Monthly change: {evol_pct:+.1f}%'))
+            elif evol_pct <= -10:
+                anomalies.append(('warning', f'Monthly change: {evol_pct:+.1f}%'))
+        
+        if max_hist and last_v / max_hist < 0.6:
+            pct = (last_v / max_hist - 1) * 100
+            anomalies.append(('critical', f'Crash vs max: {pct:+.1f}%'))
+        
+        if evol_pr is not None and evol_pr < -2:
+            anomalies.append(('warning', f'Market share loss: {evol_pr:+.2f}pp'))
+        
+        # Sustained decline
+        last3 = [v for v in vals[-3:] if v is not None and v > 0]
+        if len(last3) == 3 and last3[0] > last3[1] > last3[2]:
+            drop = (last3[2] - last3[0]) / last3[0] * 100
+            if drop < -5:
+                anomalies.append(('warning', f'3M downtrend: {drop:+.1f}%'))
+        
+        # Zero drop
+        if last_v == 0 and prev_v > 0:
+            anomalies.append(('critical', f'Dropped to zero (préc: {prev_v:,.0f})'))
+        
+        worst = 'critical' if any(a[0] == 'critical' for a in anomalies) else \
+                'warning' if anomalies else 'ok'
+        
+        results.append({
+            'site': site_name,
+            'values': vals,
+            'months': months,
+            'month_m': month_m,
+            'month_m1': month_m1,
+            'val_m': last_v,
+            'val_m1': prev_v,
+            'evol_pct': evol_pct,
+            'pr_m': pr_m,
+            'pr_m1': pr_m1,
+            'evol_pr': evol_pr,
+            'anomalies': anomalies,
+            'status': worst,
+        })
+    
+    return results, total_dedup_m, total_m
+
+# ─── SPARKLINE ────────────────────────────────────────────────────────────────
+
+def sparkline(vals, months, status, height=100):
+    color = {'critical': '#ff4444', 'warning': '#f5a623', 'ok': '#22d3a0'}.get(status, '#4b5568')
+    fill = {'critical': 'rgba(255,68,68,0.08)', 'warning': 'rgba(245,166,35,0.08)',
+            'ok': 'rgba(34,211,160,0.06)'}.get(status, 'rgba(75,85,99,0.05)')
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=months[:len(vals)], y=vals, mode='lines+markers',
+        line=dict(color=color, width=2),
+        marker=dict(size=[7 if i == len(vals)-1 else 0 for i in range(len(vals))], color=color),
+        fill='tozeroy', fillcolor=fill,
+        hovertemplate='%{x}: <b>%{y:,.0f}</b><extra></extra>',
+        connectgaps=True,
+    ))
+    fig.update_layout(
+        height=height, margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showgrid=False, tickfont=dict(size=8, color='#4b5568'), nticks=4),
+        yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.04)',
+                   tickfont=dict(size=8, color='#4b5568'), tickformat='.2s'),
+        showlegend=False,
+    )
+    return fig
+
+# ─── MAIN PAGE ────────────────────────────────────────────────────────────────
+
+def render_panel_checker_v2():
+    st.markdown("""
+    <style>
+    .verdict-ok { background: linear-gradient(135deg,#0d2818,#0a3320); border:2px solid #22d3a0;
+        border-radius:16px; padding:28px 36px; text-align:center; margin-bottom:24px; }
+    .verdict-warn { background: linear-gradient(135deg,#2d1f00,#3d2a00); border:2px solid #f5a623;
+        border-radius:16px; padding:28px 36px; text-align:center; margin-bottom:24px; }
+    .verdict-fail { background: linear-gradient(135deg,#2d0000,#3d0808); border:2px solid #ff4444;
+        border-radius:16px; padding:28px 36px; text-align:center; margin-bottom:24px; }
+    .anom-crit { background:rgba(255,68,68,0.07); border-left:3px solid #ff4444;
+        border-radius:6px; padding:8px 12px; margin:4px 0; font-size:12px; }
+    .anom-warn { background:rgba(245,166,35,0.07); border-left:3px solid #f5a623;
+        border-radius:6px; padding:8px 12px; margin:4px 0; font-size:12px; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("# 🔍 Panel Checker — Source Files Analysis")
+    st.markdown("*Upload HAM files for automatic trend analysis*")
+    st.divider()
+    
+    # ── UPLOAD ──
+    uploaded = st.file_uploader(
+        "Upload HAM files (.xlsx)",
+        type=['xlsx'],
+        accept_multiple_files=True,
+        help="Files: 1_analyse_evolution_panel, 2_analyse_performance, 3_1, 3_2, 4_1, 4_2, 5_2, 6_..."
+    )
+    
+    if not uploaded:
+        st.info("👆 Upload one or more HAM files to start the analysis")
+        cols = st.columns(4)
+        cols[0].info("📁 1_ Panel evolution")
+        cols[1].info("📁 2_ Quality performance")
+        cols[2].info("📁 5_2_ Grand Ouest")
+        cols[3].info("📁 6_ New listings IDF")
+        return
+    
+    # ── PARSE ──
+    with st.spinner("⚙️ Analysing..."):
+        all_sections = {}
+        for f in uploaded:
+            data = parse_ham_file(f.read(), f.name)
+            all_sections.update(data)
+    
+    if not all_sections:
+        st.error("No data found in the uploaded files.")
+        return
+    
+    # ── COMPUTE ALL METRICS ──
+    all_results = {}
+    total_critical = 0
+    total_warning = 0
+    
+    for key, section in all_sections.items():
+        metrics, total_dedup, total = compute_metrics(
+            section['sites'], section['totals'], section['months']
+        )
+        if metrics:
+            crits = sum(1 for m in metrics if m['status'] == 'critical')
+            warns = sum(1 for m in metrics if m['status'] == 'warning')
+            total_critical += crits
+            total_warning += warns
+            all_results[key] = {
+                **section,
+                'metrics': metrics,
+                'total_dedup_m': total_dedup,
+                'total_m': total,
+                'critical_count': crits,
+                'warning_count': warns,
+            }
+    
+    # ── VERDICT ──
+    if total_critical > 0:
+        verdict = 'REFUSED'
+        st.markdown(f"""<div class="verdict-fail">
+            <div style="font-size:2.5rem;font-weight:900;letter-spacing:4px;color:#ff4444">❌ REFUSED</div>
+            <div style="color:#fca5a5;margin-top:8px">{total_critical} critical anomaly(ies) · {total_warning} warning(s)</div>
+        </div>""", unsafe_allow_html=True)
+    elif total_warning > 3:
+        verdict = 'TO REVIEW'
+        st.markdown(f"""<div class="verdict-warn">
+            <div style="font-size:2.5rem;font-weight:900;letter-spacing:4px;color:#f5a623">⚠️ TO REVIEW</div>
+            <div style="color:#fcd48a;margin-top:8px">{total_warning} warning(s) to review</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        verdict = 'VALIDATED'
+        st.markdown(f"""<div class="verdict-ok">
+            <div style="font-size:2.5rem;font-weight:900;letter-spacing:4px;color:#22d3a0">✅ VALIDATED</div>
+            <div style="color:#a0e9d4;margin-top:8px">No critical anomaly · {total_warning} minor warning(s)</div>
+        </div>""", unsafe_allow_html=True)
+    
+    # ── STATS ──
+    sections_with_issues = len([r for r in all_results.values() if r['critical_count'] + r['warning_count'] > 0])
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Sections analysed", len(all_results))
+    m2.metric("Files", len(uploaded))
+    m3.metric("Sections with anomalies", sections_with_issues)
+    m4.metric("🔴 Criticals", total_critical)
+    m5.metric("🟡 Warnings", total_warning)
+    
+    st.divider()
+    
+    # ── FILTERS ──
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 3])
+    with col_f1:
+        sev = st.radio("", ["Tout", "🔴 Critical", "🟡 Warnings"], horizontal=True)
+    with col_f2:
+        file_opts = ["All"] + sorted(set(r['file'] for r in all_results.values()))
+        file_filter = st.selectbox("File", file_opts, label_visibility="collapsed")
+    with col_f3:
+        search = st.text_input("", placeholder="🔍 Search...", label_visibility="collapsed")
+    
+    # Apply filters
+    filtered = dict(all_results)
+    if sev == "🔴 Critical":
+        filtered = {k: v for k, v in filtered.items() if v['critical_count'] > 0}
+    elif sev == "🟡 Warnings":
+        filtered = {k: v for k, v in filtered.items() if v['warning_count'] > 0}
+    if file_filter != "All":
+        filtered = {k: v for k, v in filtered.items() if v['file'] == file_filter}
+    if search:
+        q = search.lower()
+        filtered = {k: v for k, v in filtered.items() if
+                    q in v['label'].lower() or
+                    any(q in m['site'].lower() for m in v['metrics'])}
+    
+    # Sort: critical first
+    sorted_sections = sorted(filtered.items(), key=lambda x: (-x[1]['critical_count'], -x[1]['warning_count']))
+    
+    # Info banner when validated
+    if verdict == 'VALIDATED' and total_warning > 0:
+        st.info(f"ℹ️ Panel validated — {total_warning} warning(s) to monitor below")
+    
+    st.markdown(f"### 📋 {len(filtered)} section(s)")
+    
+    # ── SECTION CARDS ──
+    for key, section in sorted_sections:
+        has_crit = section['critical_count'] > 0
+        icon = "🔴" if has_crit else "🟡" if section['warning_count'] > 0 else "✅"
+        badge = f"{section['critical_count']}c · {section['warning_count']}a"
+        
+        with st.expander(
+            f"{icon} **{section['sheet']}** — {section['label']}   `{badge}`",
+            expanded=(has_crit and len(filtered) <= 8)
+        ):
+            # Month info
+            months = section['months']
+            if months:
+                st.caption(f"📅 Period: {months[0]} → {months[-1]}  |  M = {months[-1]}  |  M-1 = {months[-2] if len(months) >= 2 else '?'}")
+            
+            # Summary table
+            metrics = sorted(section['metrics'], key=lambda m: {'critical':3,'warning':2,'ok':1}.get(m['status'],0), reverse=True)
+            
+            # Group: anomalies first, then OK
+            anom_metrics = [m for m in metrics if m['anomalies']]
+            ok_metrics = [m for m in metrics if not m['anomalies']]
+            
+            # Show anomaly sites with chart
+            if anom_metrics:
+                cols = st.columns(min(3, len(anom_metrics)))
+                for i, m in enumerate(anom_metrics[:6]):
+                    with cols[i % 3]:
+                        st_color = '#ff4444' if m['status'] == 'critical' else '#f5a623'
+                        evol_str = f"{m['evol_pct']:+.1f}%" if m['evol_pct'] is not None else "—"
+                        pr_str = f"PR: {m['pr_m']:.1f}%" if m['pr_m'] is not None else ""
+                        
+                        with st.container(border=True):
+                            hc1, hc2 = st.columns([3, 1])
+                            hc1.markdown(f"**{'🔴' if m['status']=='critical' else '🟡'} {m['site']}**")
+                            hc2.markdown(f"<span style='color:{st_color};font-weight:700'>{evol_str}</span>", unsafe_allow_html=True)
+                            
+                            if m['values']:
+                                fig = sparkline(m['values'], m['months'], m['status'])
+                                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                            
+                            # Metrics row
+                            mc1, mc2, mc3 = st.columns(3)
+                            mc1.caption(f"M: **{m['val_m']:,.0f}**")
+                            mc2.caption(f"M-1: **{m['val_m1']:,.0f}**")
+                            mc3.caption(pr_str)
+                            
+                            # Anomaly tags
+                            for anom_type, anom_detail in m['anomalies']:
+                                css = 'anom-crit' if anom_type == 'critical' else 'anom-warn'
+                                ico = '🔴' if anom_type == 'critical' else '🟡'
+                                st.markdown(f'<div class="{css}">{ico} {anom_detail}</div>', unsafe_allow_html=True)
+            
+            # Summary table for all sites
+            if metrics:
+                st.markdown("**Summary table**")
+                table_data = []
+                for m in metrics:
+                    evol = f"{m['evol_pct']:+.1f}%" if m['evol_pct'] is not None else "—"
+                    pr = f"{m['pr_m']:.1f}%" if m['pr_m'] is not None else "—"
+                    evol_pr = f"{m['evol_pr']:+.2f}pp" if m['evol_pr'] is not None else "—"
+                    status_icon = "🔴" if m['status']=='critical' else "🟡" if m['status']=='warning' else "✅"
+                    table_data.append({
+                        '': status_icon,
+                        'Site': m['site'],
+                        f"M ({m['month_m']})": f"{m['val_m']:,.0f}",
+                        f"M-1 ({m['month_m1']})": f"{m['val_m1']:,.0f}",
+                        'Evol %': evol,
+                        'PR M': pr,
+                        'Market Share Evol': evol_pr,
+                        'Anomalies': ' | '.join(a[1] for a in m['anomalies']) if m['anomalies'] else '—',
+                    })
+                df = pd.DataFrame(table_data)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    # ── EXPORT ──
+    if all_results:
+        st.divider()
+        st.markdown("### 📥 Export")
+        rows = []
+        for key, section in all_results.items():
+            for m in section['metrics']:
+                if m['anomalies']:
+                    for anom_type, anom_detail in m['anomalies']:
+                        rows.append({
+                            'File': section['file'],
+                            'Sheet': section['sheet'],
+                            'Section': section['label'],
+                            'Site': m['site'],
+                            'Sévérité': '🔴 Critical' if anom_type=='critical' else '🟡 Avertissement',
+                            'Anomaly': anom_detail,
+                            'Month M': m['month_m'],
+                            'Value M': m['val_m'],
+                            'Value M-1': m['val_m1'],
+                            'Evol %': f"{m['evol_pct']:+.1f}%" if m['evol_pct'] else '',
+                            'PR M': f"{m['pr_m']:.1f}%" if m['pr_m'] else '',
+                            'Market Share Evol': f"{m['evol_pr']:+.2f}pp" if m['evol_pr'] else '',
+                        })
+        if rows:
+            df = pd.DataFrame(rows)
+            csv = df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("⬇️ Download CSV report", data=csv,
+                             file_name=f"panel_anomalies_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                             mime='text/csv')
+
+
+
+
+"""
 Panel Checker Module — à ajouter dans app.py
 Analyse tendances du Panel Checker Excel et détecte les anomalies.
 """
@@ -163,7 +682,7 @@ def detect_anomalies(vals, months, site_name, table_label):
         mom = (last_val - prev_val) / prev_val * 100
         if mom <= -30:
             anomalies.append({
-                'type': 'Chute brutale MoM',
+                'type': 'Monthly change',
                 'severity': 'critical',
                 'detail': f"{mom:+.1f}% vs mois précédent",
                 'month': months[last_idx] if last_idx < len(months) else '?',
@@ -172,7 +691,7 @@ def detect_anomalies(vals, months, site_name, table_label):
             })
         elif mom <= -15:
             anomalies.append({
-                'type': 'Baisse significative MoM',
+                'type': 'Monthly change',
                 'severity': 'warning',
                 'detail': f"{mom:+.1f}% vs mois précédent",
                 'month': months[last_idx] if last_idx < len(months) else '?',
@@ -228,7 +747,7 @@ def detect_anomalies(vals, months, site_name, table_label):
             total_drop = (last_3[-1] - last_3[0]) / last_3[0] * 100 if last_3[0] > 0 else 0
             if total_drop < -10:
                 anomalies.append({
-                    'type': 'Tendance baissière continue',
+                    'type': 'Sustained downtrend',
                     'severity': 'warning',
                     'detail': f"3 mois consécutifs en baisse ({total_drop:+.1f}% sur 3M)",
                     'month': months[last_idx] if last_idx < len(months) else '?',
@@ -289,11 +808,11 @@ def compute_verdict(analysis_results):
     total_warning = sum(r['warning_count'] for r in analysis_results)
     
     if total_critical > 0:
-        return 'REFUSÉ', total_critical, total_warning
+        return 'REFUSED', total_critical, total_warning
     elif total_warning > 3:
-        return 'À VÉRIFIER', total_critical, total_warning
+        return 'TO REVIEW', total_critical, total_warning
     else:
-        return 'VALIDÉ', total_critical, total_warning
+        return 'VALIDATED', total_critical, total_warning
 
 # ─── SPARKLINE ────────────────────────────────────────────────────────────────
 
@@ -383,7 +902,7 @@ def render_panel_checker_page():
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown("# 🔍 Panel Checker — Analyse des Tendances")
+    st.markdown("# 🔍 Panel Checker — Trend Analysis")
     st.markdown("*Détection automatique des anomalies et validation du panel*")
     st.divider()
 
@@ -400,40 +919,40 @@ def render_panel_checker_page():
         # Show example of what we detect
         st.markdown("### Ce que nous détectons :")
         c1, c2, c3, c4 = st.columns(4)
-        c1.error("🔴 Chute brutale\n>30% MoM")
-        c2.warning("🟡 Baisse signif.\n>15% MoM")
+        c1.error("🔴 Monthly change\n>30% drop")
+        c2.warning("🟡 Monthly change\n>15% drop")
         c3.error("🔴 Crash historique\n>40% vs max")
-        c4.warning("🟡 Tendance baissière\n3 mois consécutifs")
+        c4.warning("🟡 Downtrend\n3 consecutive months")
         return
 
-    with st.spinner("⚙️ Analyse en cours... Parsing des tableaux et détection des anomalies..."):
+    with st.spinner("⚙️ Analysing... Parsing des tableaux et détection des anomalies..."):
         file_bytes = uploaded.read()
         tables = parse_panel_checker(file_bytes)
         analysis = analyze_all_tables(tables)
         verdict, n_critical, n_warning = compute_verdict(analysis)
 
     # VERDICT
-    if verdict == 'VALIDÉ':
+    if verdict == 'VALIDATED':
         st.markdown(f"""
         <div class="verdict-ok">
-            <div class="verdict-title" style="color:#22d3a0">✅ VALIDÉ</div>
+            <div class="verdict-title" style="color:#22d3a0">✅ VALIDATED</div>
             <div style="color:#a0e9d4;font-size:1rem">Aucune anomalie critique détectée</div>
-            <div style="color:#6ee7c9;font-size:0.85rem;margin-top:8px">{n_warning} avertissements mineurs</div>
+            <div style="color:#6ee7c9;font-size:0.85rem;margin-top:8px">{n_warning} minor warningineurs</div>
         </div>
         """, unsafe_allow_html=True)
-    elif verdict == 'À VÉRIFIER':
+    elif verdict == 'TO REVIEW':
         st.markdown(f"""
         <div class="verdict-warn">
-            <div class="verdict-title" style="color:#f5a623">⚠️ À VÉRIFIER</div>
-            <div style="color:#fcd48a;font-size:1rem">Plusieurs avertissements détectés</div>
-            <div style="color:#fbbf24;font-size:0.85rem;margin-top:8px">{n_warning} avertissements · {n_critical} critiques</div>
+            <div class="verdict-title" style="color:#f5a623">⚠️ TO REVIEW</div>
+            <div style="color:#fcd48a;font-size:1rem">Several warnings detected</div>
+            <div style="color:#fbbf24;font-size:0.85rem;margin-top:8px">{n_warning} warnings · {n_critical} critiques</div>
         </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown(f"""
         <div class="verdict-fail">
-            <div class="verdict-title" style="color:#ff4444">❌ REFUSÉ</div>
-            <div style="color:#fca5a5;font-size:1rem">Anomalies critiques détectées — vérification requise</div>
+            <div class="verdict-title" style="color:#ff4444">❌ REFUSED</div>
+            <div style="color:#fca5a5;font-size:1rem">Critical anomalies detected — review required</div>
             <div style="color:#f87171;font-size:0.85rem;margin-top:8px">{n_critical} critiques · {n_warning} avertissements</div>
         </div>
         """, unsafe_allow_html=True)
@@ -448,7 +967,7 @@ def render_panel_checker_page():
     m2.metric("Sites / séries", all_sites_checked)
     m3.metric("Tableaux avec anomalies", tables_with_issues)
     m4.metric("🔴 Anomalies critiques", n_critical)
-    m5.metric("🟡 Avertissements", n_warning)
+    m5.metric("🟡 Warnings", n_warning)
 
     if not analysis:
         st.success("✅ Aucune anomalie détectée dans l'ensemble des tableaux.")
@@ -457,9 +976,9 @@ def render_panel_checker_page():
     st.divider()
 
     # ── INFO: always show warnings even if VALIDÉ ──
-    if verdict == 'VALIDÉ' and n_warning > 0:
+    if verdict == 'VALIDATED' and n_warning > 0:
         st.info(f"ℹ️ Pas d'anomalie critique — mais {n_warning} avertissement(s) détecté(s) ci-dessous. À surveiller.")
-    elif verdict == 'À VÉRIFIER':
+    elif verdict == 'TO REVIEW':
         st.warning(f"⚠️ {n_warning} avertissements détectés — vérifiez les tableaux ci-dessous avant validation.")
     else:
         st.error(f"❌ {n_critical} anomalie(s) critique(s) à corriger — le panel ne peut pas être validé en l'état.")
@@ -469,7 +988,7 @@ def render_panel_checker_page():
     with col_f1:
         sev_filter = st.radio(
             "Sévérité",
-            ["Tout", "🔴 Critique seulement", "🟡 Avertissements seulement"],
+            ["Tout", "🔴 Critical seulement", "🟡 Warnings seulement"],
             index=0,
             horizontal=True,
             label_visibility="collapsed"
@@ -488,9 +1007,9 @@ def render_panel_checker_page():
     filtered = analysis
     if sheet_filter != "Tous les sheets":
         filtered = [r for r in filtered if r['sheet'] == sheet_filter]
-    if sev_filter == "🔴 Critique seulement":
+    if sev_filter == "🔴 Critical seulement":
         filtered = [r for r in filtered if r['critical_count'] > 0]
-    elif sev_filter == "🟡 Avertissements seulement":
+    elif sev_filter == "🟡 Warnings seulement":
         filtered = [r for r in filtered if r['warning_count'] > 0]
     # "Tout" shows everything — warnings always visible even if VALIDÉ
     if search_q:
@@ -566,7 +1085,7 @@ def render_panel_checker_page():
                     'Section': result['section'],
                     'Tableau': result['label'],
                     'Site': a['site'],
-                    'Sévérité': '🔴 Critique' if a['severity'] == 'critical' else '🟡 Avertissement',
+                    'Sévérité': '🔴 Critical' if a['severity'] == 'critical' else '🟡 Avertissement',
                     'Type': a['type'],
                     'Détail': a['detail'],
                     'Mois': a['month'],
@@ -579,7 +1098,7 @@ def render_panel_checker_page():
         # Download
         csv = df.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
-            "⬇️ Télécharger le rapport CSV",
+            "⬇️ Download CSV report",
             data=csv,
             file_name=f"panel_anomalies_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime='text/csv'
@@ -828,13 +1347,13 @@ with st.sidebar:
     st.divider()
     page = st.radio(
         "Navigation",
-        ["📊 Crawling Monitor", "🔍 Panel Checker"],
+        ["📊 Crawling Monitor", "✅ Panel Checker"],
         label_visibility="collapsed"
     )
     st.divider()
 
-if page == "🔍 Panel Checker":
-    render_panel_checker_page()
+if page == "✅ Panel Checker":
+    render_panel_checker_v2()
     st.stop()
 
 # ── CRAWLING MONITOR ────────────────────────────────────────────────────────
@@ -846,7 +1365,7 @@ with st.sidebar:
     # ── UPLOAD NEW MONTH ──
     st.markdown("### ➕ Nouveau mois")
     uploaded = st.file_uploader(
-        "Fichiers Excel",
+        "Files Excel",
         type=['xlsx'],
         accept_multiple_files=True,
         label_visibility="collapsed",
@@ -926,7 +1445,7 @@ with col_view:
     view = st.radio("Vue", ["Par Site", "Par Tableau"], horizontal=True, label_visibility="collapsed")
 
 with col_file:
-    selected_file = st.selectbox("Fichier", list(all_file_keys.keys()),
+    selected_file = st.selectbox("File", list(all_file_keys.keys()),
                                  format_func=lambda k: all_file_keys[k],
                                  label_visibility="collapsed")
 
