@@ -1,13 +1,595 @@
 import streamlit as st
 import plotly.graph_objects as go
+import plotly.express as px
 import pandas as pd
+import numpy as np
 from openpyxl import load_workbook
-import datetime, json
+import datetime, json, io
 from pathlib import Path
 
+"""
+Panel Checker Module — à ajouter dans app.py
+Analyse tendances du Panel Checker Excel et détecte les anomalies.
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+import pandas as pd
+import numpy as np
+import datetime
+import io
+from openpyxl import load_workbook
+
+# ─── PARSING ──────────────────────────────────────────────────────────────────
+
+SKIP_SITES = {
+    'Total','Total Panel','Total Panel Dédupliqué','Total Panel Dédupliqué - Top 5 Sites',
+    'Total Panel Dédupliqué  - Top 11 Sites','Total Panel Dédupliqué Marché',
+    'Immobilier Notaire','Immonot','Site','Département','Région',
+    'Total Panel Dedup','Total Dédupliqué',
+}
+
+def excel_date_str(v):
+    if isinstance(v, datetime.datetime):
+        return v.strftime('%b-%y')
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, (int, float)) and 40000 < v < 50000:
+        return (datetime.datetime(1899, 12, 30) + datetime.timedelta(days=int(v))).strftime('%b-%y')
+    return str(v)
+
+def parse_panel_checker(file_bytes):
+    """Parse le fichier Panel Checker Excel et retourne toutes les tables."""
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    
+    all_tables = []  # list of dicts
+    tab_sheets = [s for s in wb.sheetnames if s.lower().startswith('tab')]
+    
+    for sheet_name in tab_sheets:
+        ws = wb[sheet_name]
+        
+        # Find all Site/Département header rows (tables)
+        for r in range(1, ws.max_row + 1):
+            b = ws.cell(r, 2).value
+            if b not in ('Site', 'Département', 'Région'):
+                continue
+            
+            # Check if followed by month-like values in cols 3+
+            month_cols = []
+            months = []
+            for c in range(3, min(30, ws.max_column + 1)):
+                v = ws.cell(r, c).value
+                if v is None:
+                    continue
+                s = excel_date_str(v)
+                # Accept if it looks like a month label
+                if (isinstance(v, datetime.datetime) or
+                    (isinstance(v, (int, float)) and 40000 < v < 50000) or
+                    (isinstance(v, str) and any(m in v.lower() for m in
+                     ['-25', '-26', '-24', '-23', 'avr', 'mars', 'mai', 'juin',
+                      'juil', 'août', 'sep', 'oct', 'nov', 'dec', 'jan', 'fev']))):
+                    month_cols.append(c)
+                    months.append(s)
+            
+            if len(months) < 3:
+                continue
+            
+            # Get table label (look above for title)
+            table_label = None
+            for tr in range(r - 1, max(0, r - 5), -1):
+                v = ws.cell(tr, 2).value
+                if v and isinstance(v, str) and len(v.strip()) > 3 and v.strip() != 'Site':
+                    table_label = v.strip()
+                    break
+            if not table_label:
+                table_label = f"Table r{r}"
+            
+            # Get section label (look further up for x.x headers)
+            section_label = None
+            for tr in range(r - 1, max(0, r - 20), -1):
+                v = ws.cell(tr, 2).value
+                if v and isinstance(v, str) and len(v) > 2:
+                    # Check if it's a section header like "1.1 Total", "2.3 ..."
+                    if v[0].isdigit() and '.' in v[:4]:
+                        section_label = v.strip()
+                        break
+            
+            # Extract site data rows
+            sites = {}
+            for dr in range(r + 1, min(r + 50, ws.max_row + 1)):
+                site_name = ws.cell(dr, 2).value
+                if not site_name or not isinstance(site_name, str):
+                    break
+                if site_name.strip() in SKIP_SITES:
+                    continue
+                if site_name.strip() == '' or site_name.strip() == 'Site':
+                    break
+                
+                vals = []
+                for c in month_cols:
+                    v = ws.cell(dr, c).value
+                    if isinstance(v, (int, float)):
+                        vals.append(float(v))
+                    elif isinstance(v, str):
+                        try:
+                            vals.append(float(v.replace(',', '.').replace(' ', '')))
+                        except:
+                            vals.append(None)
+                    else:
+                        vals.append(None)
+                
+                real = [v for v in vals if v is not None and v > 0]
+                if len(real) >= 2:
+                    sites[site_name.strip()] = vals
+            
+            if sites:
+                all_tables.append({
+                    'sheet': sheet_name,
+                    'section': section_label or sheet_name,
+                    'label': table_label,
+                    'months': months,
+                    'sites': sites,
+                    'header_row': r,
+                })
+    
+    return all_tables
+
+# ─── ANOMALY DETECTION ────────────────────────────────────────────────────────
+
+def detect_anomalies(vals, months, site_name, table_label):
+    """
+    Détecte les anomalies de tendance pour une série temporelle.
+    Retourne une liste d'anomalies avec niveau de sévérité.
+    """
+    anomalies = []
+    MIN_VAL = 5  # ignore placeholder values
+    real_pairs = [(i, v) for i, v in enumerate(vals) if v is not None and v > MIN_VAL]
+    if len(real_pairs) < 3:
+        return anomalies
+    
+    indices, values = zip(*real_pairs)
+    values = list(values)
+    last_idx = indices[-1]
+    last_val = values[-1]
+    prev_val = values[-2] if len(values) >= 2 else None
+    
+    # Skip placeholder values
+    if last_val <= 5:
+        return anomalies
+    
+    # 1. MoM variation (M vs M-1)
+    if prev_val is not None and prev_val > 0:
+        mom = (last_val - prev_val) / prev_val * 100
+        if mom <= -30:
+            anomalies.append({
+                'type': 'Chute brutale MoM',
+                'severity': 'critical',
+                'detail': f"{mom:+.1f}% vs mois précédent",
+                'month': months[last_idx] if last_idx < len(months) else '?',
+                'value': last_val,
+                'prev_value': prev_val,
+            })
+        elif mom <= -15:
+            anomalies.append({
+                'type': 'Baisse significative MoM',
+                'severity': 'warning',
+                'detail': f"{mom:+.1f}% vs mois précédent",
+                'month': months[last_idx] if last_idx < len(months) else '?',
+                'value': last_val,
+                'prev_value': prev_val,
+            })
+        elif mom >= 50:
+            anomalies.append({
+                'type': 'Hausse anormale MoM',
+                'severity': 'warning',
+                'detail': f"{mom:+.1f}% vs mois précédent",
+                'month': months[last_idx] if last_idx < len(months) else '?',
+                'value': last_val,
+                'prev_value': prev_val,
+            })
+    
+    # 2. Crash vs historical max
+    if len(values) >= 4:
+        hist_max = max(values[:-1])
+        if hist_max > 0:
+            pct_from_max = (last_val - hist_max) / hist_max * 100
+            if pct_from_max <= -40:
+                anomalies.append({
+                    'type': 'Crash vs historique',
+                    'severity': 'critical',
+                    'detail': f"{pct_from_max:+.1f}% vs max historique ({hist_max:,.0f})",
+                    'month': months[last_idx] if last_idx < len(months) else '?',
+                    'value': last_val,
+                    'prev_value': hist_max,
+                })
+    
+    # 3. Z-score anomaly (statistical outlier)
+    if len(values) >= 4:
+        hist = values[:-1]
+        mean = np.mean(hist)
+        std = np.std(hist)
+        if std > 0:
+            z = (last_val - mean) / std
+            if z < -2.5:
+                anomalies.append({
+                    'type': 'Anomalie statistique (Z-score)',
+                    'severity': 'warning' if z > -3 else 'critical',
+                    'detail': f"Z-score={z:.2f} (moyenne hist.={mean:,.0f})",
+                    'month': months[last_idx] if last_idx < len(months) else '?',
+                    'value': last_val,
+                    'prev_value': mean,
+                })
+    
+    # 4. Sustained downtrend (3+ months declining)
+    if len(values) >= 4:
+        last_3 = values[-3:]
+        if all(last_3[i] > last_3[i+1] for i in range(len(last_3)-1)):
+            total_drop = (last_3[-1] - last_3[0]) / last_3[0] * 100 if last_3[0] > 0 else 0
+            if total_drop < -10:
+                anomalies.append({
+                    'type': 'Tendance baissière continue',
+                    'severity': 'warning',
+                    'detail': f"3 mois consécutifs en baisse ({total_drop:+.1f}% sur 3M)",
+                    'month': months[last_idx] if last_idx < len(months) else '?',
+                    'value': last_val,
+                    'prev_value': last_3[0],
+                })
+    
+    # 5. Value = 0 when it wasn't before
+    if last_val == 0 and len(values) >= 2:
+        prev_nonzero = [v for v in values[:-1] if v is not None and v > 0]
+        if len(prev_nonzero) >= 2:
+            anomalies.append({
+                'type': 'Valeur tombée à zéro',
+                'severity': 'critical',
+                'detail': f"Valeur précédente: {prev_nonzero[-1]:,.0f}",
+                'month': months[last_idx] if last_idx < len(months) else '?',
+                'value': 0,
+                'prev_value': prev_nonzero[-1],
+            })
+    
+    return anomalies
+
+def analyze_all_tables(tables):
+    """Analyse toutes les tables et retourne un résumé des anomalies."""
+    results = []
+    
+    for table in tables:
+        table_anomalies = []
+        months = table['months']
+        
+        for site_name, vals in table['sites'].items():
+            site_anomalies = detect_anomalies(vals, months, site_name, table['label'])
+            if site_anomalies:
+                for a in site_anomalies:
+                    table_anomalies.append({
+                        'site': site_name,
+                        **a
+                    })
+        
+        if table_anomalies:
+            results.append({
+                'sheet': table['sheet'],
+                'section': table['section'],
+                'label': table['label'],
+                'months': months,
+                'sites': table['sites'],
+                'anomalies': table_anomalies,
+                'critical_count': sum(1 for a in table_anomalies if a['severity'] == 'critical'),
+                'warning_count': sum(1 for a in table_anomalies if a['severity'] == 'warning'),
+            })
+    
+    return results
+
+# ─── VERDICT ──────────────────────────────────────────────────────────────────
+
+def compute_verdict(analysis_results):
+    total_critical = sum(r['critical_count'] for r in analysis_results)
+    total_warning = sum(r['warning_count'] for r in analysis_results)
+    
+    if total_critical > 0:
+        return 'REFUSÉ', total_critical, total_warning
+    elif total_warning > 3:
+        return 'À VÉRIFIER', total_critical, total_warning
+    else:
+        return 'VALIDÉ', total_critical, total_warning
+
+# ─── SPARKLINE ────────────────────────────────────────────────────────────────
+
+def mini_chart(vals, months, has_critical=False, has_warning=False, height=100):
+    color = '#ff4444' if has_critical else '#f5a623' if has_warning else '#22d3a0'
+    fill = 'rgba(255,68,68,0.1)' if has_critical else 'rgba(245,166,35,0.08)' if has_warning else 'rgba(34,211,160,0.06)'
+    
+    # Mark last point
+    marker_sizes = [0] * len(vals)
+    marker_colors = [color] * len(vals)
+    if vals:
+        marker_sizes[-1] = 8
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=months[:len(vals)], y=vals,
+        mode='lines+markers',
+        line=dict(color=color, width=2),
+        marker=dict(size=marker_sizes, color=marker_colors),
+        fill='tozeroy', fillcolor=fill,
+        hovertemplate='%{x}: <b>%{y:,.0f}</b><extra></extra>',
+        connectgaps=True,
+    ))
+    fig.update_layout(
+        height=height,
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(showgrid=False, tickfont=dict(size=8, color='#4b5568'), nticks=4, showline=False),
+        yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.04)',
+                   tickfont=dict(size=8, color='#4b5568'), tickformat='.2s', showline=False),
+        showlegend=False,
+    )
+    return fig
+
+# ─── MAIN PAGE ────────────────────────────────────────────────────────────────
+
+def render_panel_checker_page():
+    st.markdown("""
+    <style>
+    .verdict-ok {
+        background: linear-gradient(135deg, #0d2818 0%, #0a3320 100%);
+        border: 2px solid #22d3a0;
+        border-radius: 16px;
+        padding: 28px 36px;
+        text-align: center;
+        margin-bottom: 24px;
+    }
+    .verdict-warn {
+        background: linear-gradient(135deg, #2d1f00 0%, #3d2a00 100%);
+        border: 2px solid #f5a623;
+        border-radius: 16px;
+        padding: 28px 36px;
+        text-align: center;
+        margin-bottom: 24px;
+    }
+    .verdict-fail {
+        background: linear-gradient(135deg, #2d0000 0%, #3d0808 100%);
+        border: 2px solid #ff4444;
+        border-radius: 16px;
+        padding: 28px 36px;
+        text-align: center;
+        margin-bottom: 24px;
+    }
+    .verdict-title {
+        font-size: 2.5rem;
+        font-weight: 900;
+        letter-spacing: 4px;
+        margin-bottom: 8px;
+    }
+    .anomaly-card {
+        background: rgba(255,68,68,0.06);
+        border-left: 3px solid #ff4444;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin: 6px 0;
+        font-size: 13px;
+    }
+    .warning-card {
+        background: rgba(245,166,35,0.06);
+        border-left: 3px solid #f5a623;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin: 6px 0;
+        font-size: 13px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("# 🔍 Panel Checker — Analyse des Tendances")
+    st.markdown("*Détection automatique des anomalies et validation du panel*")
+    st.divider()
+
+    # Upload
+    uploaded = st.file_uploader(
+        "Charger le fichier Panel Checker (.xlsx)",
+        type=['xlsx'],
+        help="Fichier Panel_checker_-_LBC_-_IMMO_FR_-_Resales_*.xlsx"
+    )
+
+    if not uploaded:
+        st.info("👆 Chargez votre fichier Panel Checker pour lancer l'analyse")
+        
+        # Show example of what we detect
+        st.markdown("### Ce que nous détectons :")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.error("🔴 Chute brutale\n>30% MoM")
+        c2.warning("🟡 Baisse signif.\n>15% MoM")
+        c3.error("🔴 Crash historique\n>40% vs max")
+        c4.warning("🟡 Tendance baissière\n3 mois consécutifs")
+        return
+
+    with st.spinner("⚙️ Analyse en cours... Parsing des tableaux et détection des anomalies..."):
+        file_bytes = uploaded.read()
+        tables = parse_panel_checker(file_bytes)
+        analysis = analyze_all_tables(tables)
+        verdict, n_critical, n_warning = compute_verdict(analysis)
+
+    # VERDICT
+    if verdict == 'VALIDÉ':
+        st.markdown(f"""
+        <div class="verdict-ok">
+            <div class="verdict-title" style="color:#22d3a0">✅ VALIDÉ</div>
+            <div style="color:#a0e9d4;font-size:1rem">Aucune anomalie critique détectée</div>
+            <div style="color:#6ee7c9;font-size:0.85rem;margin-top:8px">{n_warning} avertissements mineurs</div>
+        </div>
+        """, unsafe_allow_html=True)
+    elif verdict == 'À VÉRIFIER':
+        st.markdown(f"""
+        <div class="verdict-warn">
+            <div class="verdict-title" style="color:#f5a623">⚠️ À VÉRIFIER</div>
+            <div style="color:#fcd48a;font-size:1rem">Plusieurs avertissements détectés</div>
+            <div style="color:#fbbf24;font-size:0.85rem;margin-top:8px">{n_warning} avertissements · {n_critical} critiques</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="verdict-fail">
+            <div class="verdict-title" style="color:#ff4444">❌ REFUSÉ</div>
+            <div style="color:#fca5a5;font-size:1rem">Anomalies critiques détectées — vérification requise</div>
+            <div style="color:#f87171;font-size:0.85rem;margin-top:8px">{n_critical} critiques · {n_warning} avertissements</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Summary stats
+    total_tables = len(tables)
+    tables_with_issues = len(analysis)
+    all_sites_checked = sum(len(t['sites']) for t in tables)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Tableaux analysés", total_tables)
+    m2.metric("Sites / séries", all_sites_checked)
+    m3.metric("Tableaux avec anomalies", tables_with_issues)
+    m4.metric("🔴 Anomalies critiques", n_critical)
+    m5.metric("🟡 Avertissements", n_warning)
+
+    if not analysis:
+        st.success("✅ Aucune anomalie détectée dans l'ensemble des tableaux.")
+        return
+
+    st.divider()
+
+    # ── INFO: always show warnings even if VALIDÉ ──
+    if verdict == 'VALIDÉ' and n_warning > 0:
+        st.info(f"ℹ️ Pas d'anomalie critique — mais {n_warning} avertissement(s) détecté(s) ci-dessous. À surveiller.")
+    elif verdict == 'À VÉRIFIER':
+        st.warning(f"⚠️ {n_warning} avertissements détectés — vérifiez les tableaux ci-dessous avant validation.")
+    else:
+        st.error(f"❌ {n_critical} anomalie(s) critique(s) à corriger — le panel ne peut pas être validé en l'état.")
+
+    # ── FILTERS ──
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 3])
+    with col_f1:
+        sev_filter = st.radio(
+            "Sévérité",
+            ["Tout", "🔴 Critique seulement", "🟡 Avertissements seulement"],
+            index=0,
+            horizontal=True,
+            label_visibility="collapsed"
+        )
+    with col_f2:
+        sheet_filter = st.selectbox(
+            "Sheet",
+            ["Tous les sheets"] + sorted(set(r['sheet'] for r in analysis)),
+            label_visibility="collapsed"
+        )
+    with col_f3:
+        search_q = st.text_input("Rechercher site ou tableau...", label_visibility="collapsed",
+                                  placeholder="🔍 Rechercher site ou tableau...")
+
+    # Apply filters
+    filtered = analysis
+    if sheet_filter != "Tous les sheets":
+        filtered = [r for r in filtered if r['sheet'] == sheet_filter]
+    if sev_filter == "🔴 Critique seulement":
+        filtered = [r for r in filtered if r['critical_count'] > 0]
+    elif sev_filter == "🟡 Avertissements seulement":
+        filtered = [r for r in filtered if r['warning_count'] > 0]
+    # "Tout" shows everything — warnings always visible even if VALIDÉ
+    if search_q:
+        q = search_q.lower()
+        filtered = [r for r in filtered if
+                    q in r['label'].lower() or
+                    any(q in a['site'].lower() for a in r['anomalies'])]
+
+    # Sort: critical first
+    filtered = sorted(filtered, key=lambda r: (-r['critical_count'], -r['warning_count']))
+
+    st.markdown(f"### 📋 {len(filtered)} tableau(x) avec anomalies")
+
+    # ── ANOMALY TABLE CARDS ──
+    for result in filtered:
+        has_crit = result['critical_count'] > 0
+        icon = "🔴" if has_crit else "🟡"
+        badge = f"{result['critical_count']} critique(s)" if has_crit else f"{result['warning_count']} avertissement(s)"
+
+        with st.expander(f"{icon} **{result['sheet']}** — {result['label']}   `{badge}`",
+                         expanded=(len(filtered) <= 5)):
+
+            # Group anomalies by site
+            by_site = {}
+            for a in result['anomalies']:
+                by_site.setdefault(a['site'], []).append(a)
+
+            # For each affected site: show chart + anomalies
+            for site, anoms in sorted(by_site.items(),
+                                       key=lambda x: -sum(1 for a in x[1] if a['severity']=='critical')):
+                site_vals = result['sites'].get(site, [])
+                site_crit = any(a['severity'] == 'critical' for a in anoms)
+                site_warn = any(a['severity'] == 'warning' for a in anoms)
+
+                col_chart, col_info = st.columns([3, 2])
+                with col_chart:
+                    st.markdown(f"**{'🔴' if site_crit else '🟡'} {site}**")
+                    if site_vals and any(v is not None and v > 0 for v in site_vals):
+                        fig = mini_chart(site_vals, result['months'], site_crit, site_warn, height=110)
+                        st.plotly_chart(fig, use_container_width=True,
+                                        config={'displayModeBar': False})
+
+                with col_info:
+                    st.markdown("")
+                    for a in anoms:
+                        if a['severity'] == 'critical':
+                            st.markdown(
+                                f'<div class="anomaly-card">🔴 <b>{a["type"]}</b><br>'
+                                f'<span style="color:#aaa">{a["detail"]}</span><br>'
+                                f'<span style="color:#888;font-size:11px">{a["month"]} · val={a["value"]:,.0f}</span></div>',
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            st.markdown(
+                                f'<div class="warning-card">🟡 <b>{a["type"]}</b><br>'
+                                f'<span style="color:#aaa">{a["detail"]}</span><br>'
+                                f'<span style="color:#888;font-size:11px">{a["month"]} · val={a["value"]:,.0f}</span></div>',
+                                unsafe_allow_html=True
+                            )
+
+                st.markdown("---")
+
+    # ── FULL ANOMALY EXPORT TABLE ──
+    if analysis:
+        st.divider()
+        st.markdown("### 📥 Export — Toutes les anomalies")
+
+        rows = []
+        for result in analysis:
+            for a in result['anomalies']:
+                rows.append({
+                    'Sheet': result['sheet'],
+                    'Section': result['section'],
+                    'Tableau': result['label'],
+                    'Site': a['site'],
+                    'Sévérité': '🔴 Critique' if a['severity'] == 'critical' else '🟡 Avertissement',
+                    'Type': a['type'],
+                    'Détail': a['detail'],
+                    'Mois': a['month'],
+                    'Valeur': a.get('value', ''),
+                })
+
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, height=300)
+
+        # Download
+        csv = df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            "⬇️ Télécharger le rapport CSV",
+            data=csv,
+            file_name=f"panel_anomalies_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime='text/csv'
+        )
+
+
+
 st.set_page_config(
-    page_title="Panel Checker — Crawling Monitor",
-    page_icon="📊",
+    page_title="IMMO FR — Panel Intelligence",
+    page_icon="🏠",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -238,6 +820,24 @@ def load_all_months():
 # ══════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════
+
+# ── PAGE NAVIGATION ────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🏠 IMMO FR Monitor")
+    st.markdown("*Panel Intelligence Platform*")
+    st.divider()
+    page = st.radio(
+        "Navigation",
+        ["📊 Crawling Monitor", "🔍 Panel Checker"],
+        label_visibility="collapsed"
+    )
+    st.divider()
+
+if page == "🔍 Panel Checker":
+    render_panel_checker_page()
+    st.stop()
+
+# ── CRAWLING MONITOR ────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📊 Panel Monitor")
     st.markdown("*Crawling Trend Tracker*")
