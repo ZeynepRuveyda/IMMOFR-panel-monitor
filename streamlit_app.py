@@ -1143,7 +1143,7 @@ def is_data_row(b):
     if not b or not isinstance(b, str) or len(str(b).strip()) < 2: return False
     return not any(str(b).startswith(s) for s in SKIP)
 
-def compute_metrics(vals):
+def compute_metrics_crawling(vals):
     valid = [(i,x) for i,x in enumerate(vals) if x is not None and isinstance(x,(int,float)) and x > 0]
     if len(valid) < 2: return None, None, False
     last_v, prev_v = valid[-1][1], valid[-2][1]
@@ -1219,7 +1219,7 @@ def extract_sheet(ws, sheet_name):
                 else: vals.append(None)
             real = [v for v in vals if v is not None and v > 0]
             if not real or max(real) < 1 or all(0 < v < 2 for v in real): continue
-            pv, pfm, cr = compute_metrics(vals)
+            pv, pfm, cr = compute_metrics_crawling(vals)
             site_data.append({
                 'name': str(b).strip(), 'values': vals,
                 'pct_var': pv, 'pct_from_max': pfm,
