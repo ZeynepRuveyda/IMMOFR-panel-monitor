@@ -321,6 +321,13 @@ def render_panel_checker_v2():
         cols[3].info("📁 6_ New listings IDF")
         return
     
+    # ── CHART COUNTER (unique keys) ──
+    import random
+    _chart_counter = [0]
+    def next_chart_key():
+        _chart_counter[0] += 1
+        return f"pc_chart_{_chart_counter[0]}"
+
     # ── PARSE ──
     with st.spinner("⚙️ Analysing..."):
         all_sections = {}
@@ -457,7 +464,7 @@ def render_panel_checker_v2():
                             
                             if m['values']:
                                 fig = sparkline(m['values'], m['months'], m['status'])
-                                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key=next_chart_key())
                             
                             # Metrics row
                             mc1, mc2, mc3 = st.columns(3)
