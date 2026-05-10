@@ -141,16 +141,6 @@ def run_cross_checks(files_bytes):
     return checks
 
 def classify_files(uploaded_files):
-    file_map = {
-        'file1': ['1_analyse_evolution','1_analyze_evolution'],
-        'file2': ['2_analyse_performance','2_analyze_performance'],
-        'file3_1': ['3_1_analyse','3_1_analyze'],
-        'file3_2': ['3_2_analyse','3_2_analyze'],
-        'file4_1': ['4_1_statistiques','4_1_statistics'],
-        'file4_2': ['4_2_statistiques','4_2_statistics'],
-        'file5': ['5_focus_idf','5_focus_ile','5_focus_alpes'],
-        'file5_2': ['5_2_focus','5_2_grand'],
-    }
     file_labels = {
         'file1':'1 — Evolution panel','file2':'2 — Performance qualité',
         'file3_1':'3.1 — Analyse Pros','file3_2':'3.2 — Géographique Pros',
@@ -159,11 +149,29 @@ def classify_files(uploaded_files):
     }
     files_bytes = {}
     for f in uploaded_files:
-        nl = f.name.lower().replace(' ','_')
-        for key, patterns in file_map.items():
-            if any(p in nl for p in patterns):
-                files_bytes[key] = f.read()
-                break
+        # Normalize: lowercase, remove accents aproximation, spaces to underscore
+        nl = f.name.lower().replace(' ','_').replace('é','e').replace('è','e').replace('ê','e').replace('ô','o').replace('û','u').replace('î','i').replace('à','a').replace('ù','u')
+        
+        if '5_2' in nl or ('5' in nl and ('grand' in nl or 'ouest' in nl)):
+            key = 'file5_2'
+        elif '5' in nl and ('idf' in nl or 'ile' in nl or 'alpes' in nl or 'focus' in nl) and '5_2' not in nl:
+            key = 'file5'
+        elif '4_2' in nl or ('4' in nl and ('exclus' in nl or 'partag' in nl)):
+            key = 'file4_2'
+        elif '4_1' in nl or ('4' in nl and 'stat' in nl and '4_2' not in nl):
+            key = 'file4_1'
+        elif '3_2' in nl or ('3' in nl and 'geo' in nl):
+            key = 'file3_2'
+        elif '3_1' in nl or ('3' in nl and 'pros' in nl and '3_2' not in nl):
+            key = 'file3_1'
+        elif '2' in nl and ('perform' in nl or 'qualit' in nl or 'fraich' in nl):
+            key = 'file2'
+        elif '1' in nl and ('evolution' in nl or 'annonce' in nl) and '3_1' not in nl and '4_1' not in nl:
+            key = 'file1'
+        else:
+            continue
+        
+        files_bytes[key] = f.read()
     return files_bytes, file_labels
 
 def run_all_qc_gold(uploaded_files):
