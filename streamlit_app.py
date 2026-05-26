@@ -225,7 +225,7 @@ def is_close(a, b, tol=0.01):
 # ─── HELPERS FOR SOURCE-FILE CHECKS ─────────────────────────────────────────
 
 def get_lc(ws):
-    """Son ay kolonunu (lc) ve etiketini (lm) döndür — header aranmadan."""
+    """Son ay kolonunu (lc) ve etiketini (lm) döndür."""
     for r in range(1, 15):
         mc = []
         for c in range(1, min(ws.max_column+1, 200)):
@@ -240,7 +240,7 @@ def get_lc(ws):
     return None, None
 
 def row_val(ws, label, lc, col=2, skip=0):
-    """col kolonunda tam eşleşen etiketi bul, lc kolonundaki değeri döndür. skip=N → Nth eşleşme."""
+    """col kolonunda tam eşleşen etiketi bul, lc kolonundaki değeri döndür."""
     found = 0
     for r in range(1, ws.max_row+1):
         v = ws.cell(r, col).value
@@ -266,94 +266,227 @@ def fmt(v):
     except: return str(v)
 
 # ─── TAB 3.1 CHECKS ──────────────────────────────────────────────────────────
+# Source des formules Panel Checker (vérifiées sur le fichier réel):
+#
+# tab 3.1 row 21 "contrôle type":   D21=D8+D9+D10+D11=D12
+#   → 3.1.1: Total identifiés Joreca = Agence + Intermédiaire + Notaire + Autres (Annonces col)
+#
+# tab 3.1 row 22 "contrôle identification":  D22=D18=D15+D16+D17
+#   → 3.1.1: Total général pros = Pros identifiés + Pros à identifier + Annonces incomplètes
+#
+# tab 3.1 row 23 "contrôle tab 1":  D23: D18='tab 1'!O116 (Bien'ici)
+#                                   AQ23: AQ18='tab 1'!O130 (Total Dédup Marché)
+#   → 3.1.1 Total général professionnels (Annonces col) per site
+#   == 1.2 Pro_Part Ancien annonces per site (last month col)
+
+def _311_site_cols(ws311):
+    """3.1.1 Pros par site: retourne dict site→(Pro_col, Annonces_col, Moyenne_col)"""
+    cols = {}
+    for c in range(2, ws311.max_column+1):
+        v = ws311.cell(1, c).value
+        if v and isinstance(v, str) and v.strip():
+            name = v.strip().strip("'\"")
+            h2 = ws311.cell(2, c).value
+            if h2 and str(h2).strip() == 'Pro':
+                cols[name] = (c, c+1, c+2)
+    return cols
+
+def _311_row(ws311, label):
+    """3.1.1: retourne numéro de ligne dont col1 == label"""
+    for r in range(1, ws311.max_row+1):
+        v = ws311.cell(r, 1).value
+        if v and str(v).strip() == label:
+            return r
+    return None
 
 def check_tab31(wb31_bytes, wb1_bytes):
-    """
-    Panel Checker tab 3.1 kontrolleri:
-    - contrôle type     : Agences+Intermédiaires+Notaires+Autres = Total (3.1.4)
-    - contrôle tab 1    : 3.1.4 Total Dédupliqué = 1.2 Total Panel Dédupliqué Marché (Pros)
-    - contrôle segments : sections sum = grand total (3.1.4)
-    """
     checks = []
     wb31 = load_workbook(io.BytesIO(wb31_bytes), data_only=True)
     wb1  = load_workbook(io.BytesIO(wb1_bytes), data_only=True)
 
+    ws311 = wb31['3.1.1 Pros par site ']
     ws314 = wb31['3.1.4 Evolution Pros par type']
     ws12  = wb1['1.2 Pro_Part']
 
-    lc314, lm = get_lc(ws314)
-    lc12,  _  = get_lc(ws12)
-    if not lc314 or not lc12:
-        return checks
+    lc12, lm = get_lc(ws12)
+    if not lc12: return checks
 
-    # ── CHECK A: contrôle type — Agences+Intermédiaires+Notaires+Autres = Total général
-    # Panel Checker tab 3.1 row 21: C21=C8+C9+C10+C11=C12
-    # Dans 3.1.4 : section 1 (rows 3-22) = all pros
-    #              section 2 (rows 25-45) = Agences
-    #              section 3 (rows 48-65) = Intermédiaires
-    #              section 4 (rows 70-89) = Notaires
-    #              section 5 (rows 92-111) = Autres
-    total_all  = row_val(ws314, 'Total', lc314, skip=0)          # row 18
-    agences    = row_val(ws314, 'Total', lc314, skip=1)          # row 40
-    interm     = row_val(ws314, 'Total', lc314, skip=2)          # row 63
-    notaires   = row_val(ws314, 'Total', lc314, skip=3)          # row 85
-    autres     = row_val(ws314, 'Total', lc314, skip=4)          # row 107
+    site_cols = _311_site_cols(ws311)
 
-    if all(v is not None for v in [total_all, agences, interm, notaires, autres]):
-        soma = agences + interm + notaires + autres
-        checks.append(check(
-            f"3.1.4 Agences+Interméd.+Notaires+Autres = Total ({lm})",
-            soma == total_all,
-            f"Somme segments={fmt(soma)} | Total={fmt(total_all)} | diff={fmt(abs(soma-total_all))}",
-            "error", "tab 3.1 — contrôle type"
-        ))
+    SITES = ['AvendreAlouer', "Bien'ici", 'Figaro Immo', 'Green-Acres', 'Leboncoin',
+             'LogicImmo', 'MeilleursAgents', 'OuestFrance', 'PAP', 'ParuVendu',
+             'SeLoger', 'Superimmo']
+    # 1.2 utilise 'SuperImmo' (majuscule I), 3.1.1 utilise 'Superimmo'
+    ALIAS_12 = {'Superimmo': 'SuperImmo'}
 
-    # ── CHECK B: contrôle tab 1 — 3.1.4 Total Dédupliqué = 1.2 Total Dédupliqué Marché (Pros)
-    # Panel Checker tab 3.1 row 23 AQ23: AQ18='tab 1'!O130
-    # 3.1.4 row 20 = "Total Panel Dédupliqué" (annonceurs pros dédupliqués)
-    # 1.2 Pro_Part row 21 = "Total Panel Dédupliqué Marché" (annonces pros dédup section Ancien)
-    dedup_314 = row_val(ws314, 'Total Panel Dédupliqué', lc314)
-    dedup_12  = row_val_contains(ws12, 'Dédupliqué Marché', lc12)
+    # ── CHECK A: contrôle tab 1 (row 23)
+    # Panel Checker: D23: D18 = 'tab 1'!O116 (Bien'ici)
+    # D18 dans tab 3.1 = 3.1.1 "Total général professionnels" col Annonces de Bien'ici
+    # 'tab 1'!O116 = 1.2 Pro_Part Ancien Bien'ici dernière col
+    # → 3.1.1[Total général professionnels, Annonces_col(site)] == 1.2[site, lc12]
 
-    if dedup_314 is not None and dedup_12 is not None:
-        checks.append(check(
-            f"3.1.4 Total Dédupliqué = 1.2 Total Dédupliqué Marché ({lm})",
-            is_close(float(dedup_314), float(dedup_12)),
-            f"3.1.4={fmt(dedup_314)} | 1.2={fmt(dedup_12)} | diff={fmt(abs(float(dedup_314)-float(dedup_12)))}",
-            "error", "tab 3.1 — contrôle tab 1"
-        ))
+    r_total_gen = _311_row(ws311, 'Total général professionnels')
+    if r_total_gen:
+        for site in SITES:
+            if site not in site_cols: continue
+            ann_col = site_cols[site][1]  # Annonces column
+            v311 = ws311.cell(r_total_gen, ann_col).value
 
-    # ── CHECK C: contrôle identification — par section, Dédupliqué ≤ Total
-    # Panel Checker tab 3.1 row 22: C22=C18=C16+C17
-    section_labels = [
-        ('Agences immobilières',  1),
-        ('Intermédiaires',        2),
-        ('Notaires',              3),
-        ('Autres annonceurs',     4),
-    ]
-    skip_map = {'Agences immobilières': 1, 'Intermédiaires': 2, 'Notaires': 3, 'Autres annonceurs': 4}
-    for sec_name, skip_n in section_labels:
-        sec_total = row_val(ws314, 'Total', lc314, skip=skip_n)
-        sec_dedup = row_val(ws314, 'Total Panel Dédupliqué', lc314, skip=skip_n-1)
-        if sec_total and sec_dedup and sec_total > 0:
+            site_12 = ALIAS_12.get(site, site)
+            v12 = row_val(ws12, site_12, lc12)
+
+            if v311 is not None and v12 is not None:
+                ok = (float(v311) == float(v12))
+                checks.append(check(
+                    f"[tab 1 row 23] {site}: 3.1.1 Total pros annonces = 1.2 annonces ({lm})",
+                    ok,
+                    f"3.1.1={fmt(v311)} | 1.2={fmt(v12)} | diff={fmt(abs(float(v311)-float(v12)))}",
+                    "error", "tab 3.1 — contrôle tab 1"
+                ))
+
+    # ── CHECK A bis: AQ23 — Total Panel Dédupliqué Marché
+    # AQ23: AQ18 = 'tab 1'!O130
+    # AQ18 dans tab 3.1 = 3.1.1 col 42 "Annonces dédoublonnées" row 14
+    # = 1.2 "Total Panel Dédupliqué Marché" dernière col
+    # Trouver la colonne "Annonces dédoublonnées" dans 3.1.1 (row 2 header)
+    dedup_col = None
+    for c in range(1, ws311.max_column+1):
+        h = ws311.cell(2, c).value
+        if h and isinstance(h, str) and 'dédoublonn' in h.lower():
+            dedup_col = c; break
+
+    if dedup_col and r_total_gen:
+        v311_dedup = ws311.cell(r_total_gen, dedup_col).value
+        v12_dedup  = row_val(ws12, 'Total Panel Dédupliqué Marché', lc12)
+        if v311_dedup is not None and v12_dedup is not None:
+            ok = (float(v311_dedup) == float(v12_dedup))
             checks.append(check(
-                f"3.1.4 {sec_name}: Dédupliqué ≤ Total ({lm})",
-                float(sec_dedup) <= float(sec_total),
-                f"Dédup={fmt(sec_dedup)} | Total={fmt(sec_total)}",
-                "warning", "tab 3.1 — contrôle identification"
+                f"[tab 3.1 AQ23] Total Annonces Dédoublonnées: 3.1.1 = 1.2 Dédupliqué Marché ({lm})",
+                ok,
+                f"3.1.1={fmt(v311_dedup)} | 1.2={fmt(v12_dedup)} | diff={fmt(abs(float(v311_dedup)-float(v12_dedup)))}",
+                "error", "tab 3.1 — contrôle tab 1"
+            ))
+
+    # ── CHECK B: contrôle type (row 21)
+    # D21=D8+D9+D10+D11=D12
+    # 3.1.1: Total identifiés Joreca = Agence + Intermédiaire + Notaire + Autres (Annonces col)
+    r_total_id  = _311_row(ws311, 'Total identifiés base Joreca')
+    r_agence    = _311_row(ws311, 'Agence immobilière')
+    r_interm    = _311_row(ws311, 'Intermédiaire')
+    r_notaire   = _311_row(ws311, 'Notaire')
+    r_autres    = _311_row(ws311, 'autres (uniquement le Autres Hors Promoteur et Constructeur)')
+    if r_autres is None:
+        r_autres = _311_row(ws311, 'Autres')
+
+    if all(r is not None for r in [r_total_id, r_agence, r_interm, r_notaire, r_autres]):
+        for site in SITES:
+            if site not in site_cols: continue
+            ann_col = site_cols[site][1]
+            t  = ws311.cell(r_total_id, ann_col).value
+            ag = ws311.cell(r_agence,   ann_col).value
+            it = ws311.cell(r_interm,   ann_col).value
+            no = ws311.cell(r_notaire,  ann_col).value
+            au = ws311.cell(r_autres,   ann_col).value
+            vals = [t, ag, it, no, au]
+            if all(isinstance(v, (int,float)) for v in vals) and float(t) > 0:
+                soma = float(ag) + float(it) + float(no) + float(au)
+                ok   = (soma == float(t))
+                checks.append(check(
+                    f"[tab 1 row 21] {site}: Agences+Interm+Notaires+Autres = Total identifiés ({lm})",
+                    ok,
+                    f"Somme={fmt(soma)} | Total={fmt(t)} | diff={fmt(abs(soma-float(t)))}",
+                    "error", "tab 3.1 — contrôle type"
+                ))
+
+    # ── CHECK C: contrôle identification (row 22)
+    # D22=D18=D15+D16+D17
+    # 3.1.1: Total général pros (Annonces) = Pros identifiés + Pros à identifier + Annonces incomplètes
+    r_pros_id   = _311_row(ws311, 'Pros identifiés Joreca')
+    r_pros_nid  = _311_row(ws311, 'Pros à identifier Joreca')
+    r_incomplet = _311_row(ws311, 'Annonces incomplètes')
+
+    if all(r is not None for r in [r_total_gen, r_pros_id, r_pros_nid, r_incomplet]):
+        for site in SITES:
+            if site not in site_cols: continue
+            ann_col = site_cols[site][1]
+            tg = ws311.cell(r_total_gen,  ann_col).value
+            pi = ws311.cell(r_pros_id,    ann_col).value
+            pn = ws311.cell(r_pros_nid,   ann_col).value
+            ai = ws311.cell(r_incomplet,  ann_col).value
+            vals = [tg, pi, pn, ai]
+            if all(isinstance(v, (int,float)) for v in vals) and float(tg) > 0:
+                soma = float(pi) + float(pn) + float(ai)
+                ok   = (soma == float(tg))
+                checks.append(check(
+                    f"[tab 1 row 22] {site}: Pros id+non id+incomplets = Total général ({lm})",
+                    ok,
+                    f"Somme={fmt(soma)} | Total={fmt(tg)} | diff={fmt(abs(soma-float(tg)))}",
+                    "error", "tab 3.1 — contrôle identification"
+                ))
+
+    # ── CHECK D: contrôle type sur 3.1.4 (segments Agences/Interm/Notaires/Autres)
+    # tab 3.1 row 21: annonceurs totaux = somme des sous-types
+    lc314, _ = get_lc(ws314)
+    if lc314:
+        total_all = row_val(ws314, 'Total', lc314, skip=0)
+        agences   = row_val(ws314, 'Total', lc314, skip=1)
+        interm314 = row_val(ws314, 'Total', lc314, skip=2)
+        notaires  = row_val(ws314, 'Total', lc314, skip=3)
+        autres314 = row_val(ws314, 'Total', lc314, skip=4)
+        if all(v is not None for v in [total_all, agences, interm314, notaires, autres314]):
+            soma = agences + interm314 + notaires + autres314
+            checks.append(check(
+                f"[tab 1 row 21] 3.1.4 Agences+Interméd+Notaires+Autres = Total annonceurs ({lm})",
+                soma == total_all,
+                f"Somme={fmt(soma)} | Total={fmt(total_all)} | diff={fmt(abs(soma-total_all))}",
+                "error", "tab 3.1 — contrôle type (3.1.4)"
             ))
 
     return checks
 
 # ─── TAB 3.2 CHECKS ──────────────────────────────────────────────────────────
+# Source des formules Panel Checker (vérifiées):
+#
+# tab 3.2 row 24 "contrôle tab 3.1.4":
+#   K24: K22='tab 3.1'!$O194  (Leboncoin)
+#   AA24: AA22='tab 3.1'!$O202  (Total)
+#   → 3.2.1 TOTAL row per site == 3.1.4 "Annonceurs professionnels identifiés"[site, lc]
+#     (tab 3.1 O190-O202 = 3.1.4 section 1 rows 6-20)
+#
+# tab 3.2 row 25 "contrôle segment":
+#   K25: K22=K45+K69+K91+K113
+#   → 3.2.1 grand TOTAL = Agences TOTAL + Intermédiaires TOTAL + Notaires TOTAL + Autres TOTAL
+#
+# tab 3.2 row 47 "contrôle tab 3.1.4" (Agences):
+#   K47: K45='tab 3.1'!$O216
+#   → 3.2.1 Agences TOTAL per site == 3.1.4 Agences[site, lc]
+#
+# tab 3.2 row 48 "contrôle tab 3.2.2":
+#   K48: K45=K348
+#   → 3.2.1 Agences TOTAL == 3.2.2 Agences total per département (sum)
+
+def _321_site_cols(ws321):
+    """3.2.1: retourne dict site→Pros_col (row 6 = sites, row 7 = Pros/Poids)"""
+    cols = {}
+    for c in range(3, ws321.max_column+1):
+        raw = ws321.cell(6, c).value
+        if raw and isinstance(raw, str):
+            name = raw.strip().strip("'\"")
+            h7 = ws321.cell(7, c).value
+            if h7 and str(h7).strip() == 'Pros':
+                cols[name] = c
+    return cols
+
+def _321_total_rows(ws321):
+    """3.2.1: retourne liste des row indices avec label 'TOTAL' col 2"""
+    rows = []
+    for r in range(1, ws321.max_row+1):
+        v = ws321.cell(r, 2).value
+        if v and str(v).strip().upper() == 'TOTAL':
+            rows.append(r)
+    return rows
 
 def check_tab32(wb32_bytes, wb31_bytes):
-    """
-    Panel Checker tab 3.2 kontrolleri:
-    - contrôle tab 3.1.4 : 3.2.1 Total par site = 3.1.4 Total Dédupliqué par site
-    - contrôle segment   : 3.2.1 Grand Total = Agences+Interméd.+Notaires+Autres
-    - contrôle total     : chaque section TOTAL = sum des régions
-    """
     checks = []
     wb32 = load_workbook(io.BytesIO(wb32_bytes), data_only=True)
     wb31 = load_workbook(io.BytesIO(wb31_bytes), data_only=True)
@@ -363,101 +496,84 @@ def check_tab32(wb32_bytes, wb31_bytes):
     lc314, lm = get_lc(ws314)
     if not lc314: return checks
 
-    # ── BUILD 3.2.1 SITE COLUMN MAP ──
-    # Row 6 = site names (avec quotes dans certains fichiers), row 7 = Pros/Poids
-    # Colonnes impaires = Pros, paires = Poids
-    site_col_map = {}  # site_name -> col index (Pros column)
-    for c in range(3, ws321.max_column+1):
-        raw = ws321.cell(6, c).value
-        if raw and isinstance(raw, str):
-            name = raw.strip().strip("'\"")
-            # Ne garder que les colonnes "Pros" (col 7 = Pros/Poids alternance)
-            header7 = ws321.cell(7, c).value
-            if header7 and 'Pros' in str(header7):
-                site_col_map[name] = c
+    site_cols = _321_site_cols(ws321)
+    total_rows = _321_total_rows(ws321)
 
-    # ── FIND SECTION TOTAL ROWS in 3.2.1 ──
-    # Structure: section 1 (all pros) rows 8→106 with TOTAL at row 106
-    #            section 2 (Agences) rows → with TOTAL
-    #            etc.
-    total_rows = []  # list of row indices with label 'TOTAL'
-    for r in range(1, ws321.max_row+1):
-        v = ws321.cell(r, 2).value
-        if v and str(v).strip().upper() == 'TOTAL':
-            total_rows.append(r)
+    SITES = ['AvendreAlouer', "Bien'ici", 'Figaro Immo', 'GreenAcres', 'Leboncoin',
+             'LogicImmo', 'MeilleursAgents', 'OuestFrance', 'PAP', 'ParuVendu',
+             'SeLoger', 'Superimmo', 'Total']
+    ALIAS_314 = {'GreenAcres': 'Green-Acres'}
 
-    # ── CHECK A: contrôle tab 3.1.4
-    # 3.2.1 Grand Total per site = 3.1.4 Total Dédupliqué per site
-    # Panel Checker: K24: K22='tab 3.1'!$O194
-    # K22 = 3.2.1 Leboncoin TOTAL (section 1, grand total row)
-    # tab 3.1 O194 = 3.1.4 Leboncoin Total Dédupliqué
-    #
-    # 3.1.4 n'a PAS de colonnes par site — chaque site est une ROW, colonnes = mois
-    # Donc: pour chaque site dans 3.1.4, chercher row_val(ws314, site, lc314)
-    # et comparer avec 3.2.1 TOTAL col pour ce site
-    SITES_314 = ["Bien'ici", 'Figaro Immo', 'Green-Acres', 'Leboncoin',
-                 'LogicImmo', 'MeilleursAgents', 'OuestFrance', 'PAP',
-                 'ParuVendu', 'SeLoger', 'Superimmo']
-    SITE_ALIAS = {'GreenAcres': 'Green-Acres', 'SuperImmo': 'Superimmo',
-                  'Green-Acres': 'Green-Acres'}
-
+    # ── CHECK A: contrôle tab 3.1.4 (row 24) ──
+    # 3.2.1 TOTAL (section 1, grand total row) per site == 3.1.4 site row, lc314
+    # tab 3.1 O190-O202 = 3.1.4 section 1 "Annonceurs professionnels identifiés":
+    #   row 190=AvendreAlouer, 191=Bien'ici, ..., 202=Total, 204=Total Dédupliqué
     if total_rows:
-        grand_total_row = total_rows[0]  # première section = all pros
-        for site in SITES_314:
-            # 3.1.4 value for this site
-            v314 = row_val(ws314, site, lc314)
-            if v314 is None:
-                # try alias
-                for alias, canonical in SITE_ALIAS.items():
-                    if canonical == site:
-                        v314 = row_val(ws314, alias, lc314)
-                        if v314: break
-
-            # 3.2.1 TOTAL for this site
-            v321 = None
-            for name, col in site_col_map.items():
-                canon = SITE_ALIAS.get(name, name)
-                if canon == site or name == site:
-                    v321 = ws321.cell(grand_total_row, col).value
-                    break
+        grand_row = total_rows[0]
+        for site in SITES:
+            site_314 = ALIAS_314.get(site, site)
+            v314 = row_val(ws314, site_314, lc314)
+            v321 = site_cols.get(site) and ws321.cell(grand_row, site_cols[site]).value
 
             if v314 is not None and v321 is not None and float(v314) > 0:
+                ok = (float(v314) == float(v321))
                 checks.append(check(
-                    f"3.2.1 {site} TOTAL = 3.1.4 {site} ({lm})",
-                    is_close(float(v314), float(v321)),
+                    f"[tab 3.2 row 24] {site}: 3.2.1 TOTAL = 3.1.4 annonceurs ({lm})",
+                    ok,
                     f"3.1.4={fmt(v314)} | 3.2.1={fmt(v321)} | diff={fmt(abs(float(v314)-float(v321)))}",
                     "error", "tab 3.2 — contrôle tab 3.1.4"
                 ))
 
-    # ── CHECK B: contrôle segment
-    # 3.2.1 Grand Total = section Agences + Intermédiaires + Notaires + Autres
-    # Panel Checker: K25: K22=K45+K69+K91+K113
-    # total_rows[0]=all pros, total_rows[1]=Agences, total_rows[2]=Interm, ...
-    if len(total_rows) >= 5 and site_col_map:
-        # Pour chaque site, vérifier grand_total = sum des 4 sections
-        for site in SITES_314:
-            col = None
-            for name, c in site_col_map.items():
-                canon = SITE_ALIAS.get(name, name)
-                if canon == site or name == site:
-                    col = c; break
+    # ── CHECK B: contrôle segment (row 25) ──
+    # K25: K22=K45+K69+K91+K113
+    # total_rows[0]=all pros, [1]=Agences, [2]=Intermédiaires, [3]=Notaires, [4]=Autres
+    if len(total_rows) >= 5:
+        for site in SITES:
+            col = site_cols.get(site)
             if col is None: continue
-
-            gt   = ws321.cell(total_rows[0], col).value  # grand total
-            ag   = ws321.cell(total_rows[1], col).value  # agences
-            intr = ws321.cell(total_rows[2], col).value  # intermédiaires
-            nt   = ws321.cell(total_rows[3], col).value  # notaires
-            aut  = ws321.cell(total_rows[4], col).value  # autres
-
-            vals = [gt, ag, intr, nt, aut]
+            gt  = ws321.cell(total_rows[0], col).value
+            ag  = ws321.cell(total_rows[1], col).value
+            it  = ws321.cell(total_rows[2], col).value
+            nt  = ws321.cell(total_rows[3], col).value
+            au  = ws321.cell(total_rows[4], col).value
+            vals = [gt, ag, it, nt, au]
             if all(isinstance(v, (int,float)) for v in vals) and float(gt) > 0:
-                soma = float(ag) + float(intr) + float(nt) + float(aut)
+                soma = float(ag)+float(it)+float(nt)+float(au)
+                ok = (soma == float(gt))
                 checks.append(check(
-                    f"3.2.1 {site} Grand Total = Agences+Interméd.+Notaires+Autres ({lm})",
-                    is_close(soma, float(gt)),
+                    f"[tab 3.2 row 25] {site}: 3.2.1 Grand Total = Agences+Interméd+Notaires+Autres ({lm})",
+                    ok,
                     f"Somme={fmt(soma)} | Grand Total={fmt(gt)} | diff={fmt(abs(soma-float(gt)))}",
                     "error", "tab 3.2 — contrôle segment"
                 ))
+
+    # ── CHECK C: contrôle tab 3.1.4 par section (row 47) ──
+    # K47: K45='tab 3.1'!$O216 (Agences Bien'ici)
+    # 3.1.4 section Agences (rows 28-43): row 40=Total, rows 28-39=sites
+    SECTIONS_3_1_4 = [
+        ('Agences immobilières',  1, 'tab 3.2 — contrôle tab 3.1.4 (Agences)'),
+        ('Intermédiaires',        2, 'tab 3.2 — contrôle tab 3.1.4 (Interméd.)'),
+        ('Notaires',              3, 'tab 3.2 — contrôle tab 3.1.4 (Notaires)'),
+        ('Autres annonceurs',     4, 'tab 3.2 — contrôle tab 3.1.4 (Autres)'),
+    ]
+    if len(total_rows) >= 5:
+        for sec_label, sec_idx, sheet_label in SECTIONS_3_1_4:
+            sec_row_321 = total_rows[sec_idx]
+            for site in SITES:
+                site_314 = ALIAS_314.get(site, site)
+                # 3.1.4 section rows: skip=sec_idx finds the section's site row
+                v314 = row_val(ws314, site_314, lc314, skip=sec_idx)
+                col = site_cols.get(site)
+                if col is None or v314 is None: continue
+                v321 = ws321.cell(sec_row_321, col).value
+                if v321 is not None and float(v314) > 0:
+                    ok = (float(v314) == float(v321))
+                    checks.append(check(
+                        f"[tab 3.2 row 47+] {sec_label} {site}: 3.2.1 = 3.1.4 ({lm})",
+                        ok,
+                        f"3.1.4={fmt(v314)} | 3.2.1={fmt(v321)} | diff={fmt(abs(float(v314)-float(v321)))}",
+                        "error", sheet_label
+                    ))
 
     return checks
 
