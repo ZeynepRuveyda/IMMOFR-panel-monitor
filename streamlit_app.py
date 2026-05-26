@@ -319,40 +319,44 @@ def check_tab31(wb31_bytes, wb1_bytes):
     # 1.2 utilise 'SuperImmo' (majuscule I), 3.1.1 utilise 'Superimmo'
     ALIAS_12 = {'Superimmo': 'SuperImmo'}
 
-    # ── CHECK A: contrôle tab 1 (row 23)
-    # Panel Checker: D23: D18 = 'tab 1'!O116 (Bien'ici)
-    # D18 dans tab 3.1 = 3.1.1 "Total général professionnels" col Annonces de Bien'ici
-    # 'tab 1'!O116 = 1.2 Pro_Part Ancien Bien'ici dernière col
-    # → 3.1.1[Total général professionnels, Annonces_col(site)] == 1.2[site, lc12]
+    # ── CHECK A: contrôle tab 1 (row 23) — site par site
+    # D23: D18 (Bien'ici Total général annonces dans 3.1.1) = 'tab 1'!O116 (1.2 Bien'ici annonces)
+    # Vérifie que chaque site dans 3.1.1 "Total général professionnels" Annonces col
+    # correspond bien à la même valeur dans 1.2 Pro_Part Ancien
 
     r_total_gen = _311_row(ws311, 'Total général professionnels')
     if r_total_gen:
         for site in SITES:
             if site not in site_cols: continue
-            ann_col = site_cols[site][1]  # Annonces column
+            ann_col = site_cols[site][1]
             v311 = ws311.cell(r_total_gen, ann_col).value
-
             site_12 = ALIAS_12.get(site, site)
             v12 = row_val(ws12, site_12, lc12)
-
             if v311 is not None and v12 is not None:
                 ok = (float(v311) == float(v12))
                 checks.append(check(
-                    f"[tab 1 row 23] {site}: 3.1.1 Total pros annonces = 1.2 annonces ({lm})",
+                    f"[row 23] {site} — 3.1.1 Total général = 1.2 annonces {lm}",
                     ok,
-                    f"3.1.1={fmt(v311)} | 1.2={fmt(v12)} | diff={fmt(abs(float(v311)-float(v12)))}",
+                    (f"✅ {site} cohérent : {fmt(v311)} annonces." if ok else
+                     f"❌ 3.1.1 'Total général professionnels' Annonces = {fmt(v311)}"
+                     f" | 1.2 '{site}' = {fmt(v12)}"
+                     f" | Différence = {fmt(abs(float(v311)-float(v12)))} annonces"),
                     "error", "tab 3.1 — contrôle tab 1"
                 ))
 
     # ── CHECK A bis: AQ23 — Total Panel Dédupliqué Marché
     # AQ23: AQ18 = 'tab 1'!O130
-    # AQ18 dans tab 3.1 = 3.1.1 col 42 "Annonces dédoublonnées" row 14
-    # = 1.2 "Total Panel Dédupliqué Marché" dernière col
-    # Trouver la colonne "Annonces dédoublonnées" dans 3.1.1 (row 2 header)
+    # tab 3.1 AQ18 = 3.1.1 col 42 header="Annonces dédoublonnées", row 14 "Total général professionnels"
+    # 'tab 1'!O130 = 1.2 Pro_Part "Total Panel Dédupliqué Marché" dernière col
+    #
+    # ATTENTION: 3.1.1 a deux colonnes contenant "dédoublonn":
+    #   col 41 = "Pros dédoublonnés"   → row 14 = 89,056  (nombre d'annonceurs)
+    #   col 42 = "Annonces dédoublonnées" → row 14 = 1,406,035 (nombre d'annonces) ← C'EST CELUI-CI
+    # On cherche la colonne dont row 2 = "Annonces dédoublonnées" (pas "Pros dédoublonnés")
     dedup_col = None
     for c in range(1, ws311.max_column+1):
         h = ws311.cell(2, c).value
-        if h and isinstance(h, str) and 'dédoublonn' in h.lower():
+        if h and isinstance(h, str) and h.strip().lower() == 'annonces dédoublonnées':
             dedup_col = c; break
 
     if dedup_col and r_total_gen:
@@ -361,10 +365,14 @@ def check_tab31(wb31_bytes, wb1_bytes):
         if v311_dedup is not None and v12_dedup is not None:
             ok = (float(v311_dedup) == float(v12_dedup))
             checks.append(check(
-                f"[tab 3.1 AQ23] Total Annonces Dédoublonnées: 3.1.1 = 1.2 Dédupliqué Marché ({lm})",
+                f"[AQ23] 3.1.1 Annonces dédoublonnées ({fmt(v311_dedup)}) = 1.2 Total Panel Dédupliqué Marché ({fmt(v12_dedup)}) — {lm}",
                 ok,
-                f"3.1.1={fmt(v311_dedup)} | 1.2={fmt(v12_dedup)} | diff={fmt(abs(float(v311_dedup)-float(v12_dedup)))}",
-                "error", "tab 3.1 — contrôle tab 1"
+                (f"✅ Les deux fichiers sont cohérents : {fmt(v311_dedup)} annonces dédoublonnées." if ok else
+                 f"❌ 3.1.1 col 'Annonces dédoublonnées' (Total général) = {fmt(v311_dedup)}"
+                 f" | 1.2 'Total Panel Dédupliqué Marché' = {fmt(v12_dedup)}"
+                 f" | Différence = {fmt(abs(float(v311_dedup)-float(v12_dedup)))} annonces"
+                 f" → Demander à l'équipe de vérifier le fichier 3.1 ou 1."),
+                "error", "tab 3.1 — contrôle tab 1 (AQ23)"
             ))
 
     # ── CHECK B: contrôle type (row 21)
@@ -575,9 +583,122 @@ def check_tab32(wb32_bytes, wb31_bytes):
                         "error", sheet_label
                     ))
 
+    # ── CHECK D: contrôle MAX <= Total Dédupliqué (tab 3.2 row 68/473)
+    # Formule: =MAX(C68,...,Y68)<=AG68
+    # Pour chaque région: max(sites) doit être <= Total Dédupliqué
+    # Si MAX > Dédup → erreur de déduplication dans les données sources
+    dedup_col_321 = None
+    for c in range(3, ws321.max_column+1):
+        h6 = ws321.cell(6, c).value
+        h7 = ws321.cell(7, c).value
+        if h6 and 'Dédupliqué' in str(h6) and h7 and 'Pros' in str(h7):
+            dedup_col_321 = c; break
+    
+    site_cols_list = sorted(site_cols.values())
+    if dedup_col_321 and site_cols_list:
+        violations = []
+        for r in range(8, ws321.max_row+1):
+            region = ws321.cell(r, 2).value
+            if not region or not isinstance(region, str): continue
+            if str(region).strip().upper() in ('TOTAL', 'SITE', 'DÉPARTEMENT', 'RÉGION', ''): continue
+            
+            site_vals = [ws321.cell(r, c).value for c in site_cols_list
+                        if isinstance(ws321.cell(r, c).value, (int,float)) and ws321.cell(r, c).value > 0]
+            dedup_val = ws321.cell(r, dedup_col_321).value
+            
+            if site_vals and isinstance(dedup_val, (int,float)) and dedup_val >= 0:
+                max_val = max(site_vals)
+                if max_val > dedup_val:
+                    violations.append(f"{region.strip()} (MAX={fmt(max_val)} > Dédup={fmt(dedup_val)})")
+        
+        if violations:
+            checks.append(check(
+                f"[tab 3.2] MAX(sites) ≤ Total Dédupliqué pour chaque région ({lm})",
+                False,
+                f"❌ {len(violations)} région(s) avec incohérence : {', '.join(violations[:5])}"
+                + (f" et {len(violations)-5} autres" if len(violations) > 5 else "")
+                + " → Vérifier la déduplication dans le fichier 3.2",
+                "error", "tab 3.2 — contrôle déduplication"
+            ))
+        else:
+            checks.append(check(
+                f"[tab 3.2] MAX(sites) ≤ Total Dédupliqué pour chaque région ({lm})",
+                True, "✅ Toutes les régions sont cohérentes.", "error",
+                "tab 3.2 — contrôle déduplication"
+            ))
+
     return checks
 
-# ─── ALL TABS CHECKS (tab 1, 2, 4.1, 4.2, 5, 5-2) ───────────────────────────
+def check_tab5_vs_tab32(wb5_bytes, wb32_bytes):
+    """
+    Panel Checker tab 5 satır 347/360/386 — IDF/Alpes Maritimes pros:
+    Formül: =H342='tab 3.2'!$AE$256  →  tab5 Agences06 pros = 3.2.1 Alpes-Maritimes MeilleursAgents pros
+    Formül: =H381='tab 3.2'!$AE$634  →  tab5 Autres06 pros = 3.2.1 Autres Alpes-Maritimes pros
+    """
+    checks = []
+    try:
+        wb5  = load_workbook(io.BytesIO(wb5_bytes), data_only=True)
+        wb32 = load_workbook(io.BytesIO(wb32_bytes), data_only=True)
+    except Exception:
+        return checks
+
+    ws5  = wb5[wb5.sheetnames[0]]
+    if '3.2.2 Pros par département' not in wb32.sheetnames:
+        return checks
+    ws322 = wb32['3.2.2 Pros par département']
+
+    # tab 5 (Focus IDF & Alpes-Maritimes) yapısı
+    # Bulmamız gereken: Alpes-Maritimes (06) satırları per section
+    # Panel Checker tab 5 H/I kolonları = bazı site değerleri
+    # Karşılaştırma 3.2.2'deki Alpes-Maritimes departmanıyla yapılıyor
+
+    # 3.2.2'de Alpes-Maritimes (06) satırını bul
+    alpes_row_322 = None
+    for r in range(1, min(ws322.max_row+1, 200)):
+        v = ws322.cell(r, 1).value
+        if v and ('alpes' in str(v).lower() or '06' in str(v)):
+            alpes_row_322 = r; break
+
+    if not alpes_row_322:
+        return checks
+
+    lm = None
+    # 3.2.2 header satırından son ay ve site kolonlarını bul
+    for r in range(1, 10):
+        for c in range(1, ws322.max_column+1):
+            v = ws322.cell(r, c).value
+            if isinstance(v, datetime.datetime):
+                lm = v.strftime('%b-%y'); break
+        if lm: break
+
+    # tab 5 kaynak dosyasında Alpes-Maritimes satırlarını bul
+    alpes_rows_5 = []
+    for r in range(1, ws5.max_row+1):
+        v = ws5.cell(r, 2).value or ws5.cell(r, 1).value
+        if v and ('alpes' in str(v).lower() or '06' in str(v) or 'maritimes' in str(v).lower()):
+            alpes_rows_5.append((r, str(v)))
+
+    # tab 5 son ay col
+    lc5, lm5 = get_lc(ws5)
+    # tab 3.2.2 son ay col
+    lc322, _ = get_lc(ws322)
+
+    if lc5 and lc322 and alpes_rows_5:
+        for r5, label5 in alpes_rows_5[:5]:
+            v5 = ws5.cell(r5, lc5).value
+            v322 = ws322.cell(alpes_row_322, lc322).value
+            if isinstance(v5, (int,float)) and isinstance(v322, (int,float)) and v5 > 0:
+                ok = (v5 == v322)
+                checks.append(check(
+                    f"[tab 5 Alpes-Maritimes] {label5}: fichier 5 = 3.2.2 Alpes-Maritimes ({lm5 or lm})",
+                    ok,
+                    (f"✅ Cohérent : {fmt(v5)}" if ok else
+                     f"❌ tab5={fmt(v5)} | 3.2.2 Alpes-Maritimes={fmt(v322)} | diff={fmt(abs(v5-v322))}"
+                     f" → Vérifier les fichiers 5 et 3.2"),
+                    "error", "tab 5 — contrôle vs tab 3.2"
+                ))
+
+    return checks
 
 def check_generic_tab(wb_bytes, file_label):
     """Generic checks for all files: total consistency, dedup logic, evol% anomalies."""
@@ -786,9 +907,12 @@ def run_all_qc_gold(uploaded_files):
     # 3.1 × 1 — contrôle type + contrôle tab 1
     if 'file3_1' in files_bytes and 'file1' in files_bytes:
         all_checks += check_tab31(files_bytes['file3_1'], files_bytes['file1'])
-    # 3.2 × 3.1 — contrôle tab 3.1.4 + contrôle segment
+    # 3.2 × 3.1 — contrôle tab 3.1.4 + contrôle segment + MAX dédup
     if 'file3_2' in files_bytes and 'file3_1' in files_bytes:
         all_checks += check_tab32(files_bytes['file3_2'], files_bytes['file3_1'])
+    # tab 5 × tab 3.2 — Alpes-Maritimes cross-check
+    if 'file5' in files_bytes and 'file3_2' in files_bytes:
+        all_checks += check_tab5_vs_tab32(files_bytes['file5'], files_bytes['file3_2'])
     # Generic checks for all files
     for key, label in file_labels.items():
         if key in files_bytes:
