@@ -628,6 +628,256 @@ def check_tab5_vs_tab32(wb5_bytes, wb32_bytes):
 
     return checks
 
+def check_tab411_vs_tab1(wb41_bytes, wb1_bytes):
+    """
+    tab 4.1.1 rows 171/193/215/237 — 'contrôle tab 1-4' (hardcoded False dans Panel Checker)
+    Formül olmasi gereken: 4.1.1 Pros Ventes + Pros Locations per site = 1.1 Ancien Pros per site
+    Section yapısı:
+      4.1.1 row 80 TOTAL = 'Ancien - Total Annonces de Ventes de Professionnels'
+      4.1.1 row 100 TOTAL = 'Ancien - Total Annonces de Locations de Professionnels'
+      1.1 rows 27-42 = Annonces Ancien Pros per site (dernier col)
+    """
+    checks = []
+    try:
+        wb41 = load_workbook(io.BytesIO(wb41_bytes), data_only=True)
+        wb1  = load_workbook(io.BytesIO(wb1_bytes), data_only=True)
+    except Exception:
+        return checks
+
+    if '4.1.1 Régions - Annonces' not in wb41.sheetnames: return checks
+    ws411 = wb41['4.1.1 Régions - Annonces']
+    ws11  = wb1['1.1 Total']
+    lc1, lm = get_lc(ws11)
+    if not lc1: return checks
+
+    SITES = ['AvendreAlouer', "Bien'ici", 'Figaro Immo', 'Green-Acres', 'Leboncoin',
+             'LogicImmo', 'MeilleursAgents', 'OuestFrance', 'PAP', 'ParuVendu',
+             'SeLoger', 'Superimmo']
+    ALIAS_411 = {'GreenAcres': 'Green-Acres', 'SuperImmo': 'Superimmo'}
+    ALIAS_11  = {'SuperImmo': 'Superimmo'}
+
+    # 4.1.1 site column mapping (row 5 = headers)
+    site_col_411 = {}
+    for c in range(3, ws411.max_column+1):
+        h = ws411.cell(5, c).value
+        if h:
+            name = ALIAS_411.get(str(h).strip(), str(h).strip())
+            site_col_411[name] = c
+
+    # 4.1.1 TOTAL row per section
+    # row 80 = Pros Ventes TOTAL, row 100 = Pros Locations TOTAL
+    # Verification: find exact TOTAL rows by scanning
+    section_total_rows = {}
+    section_headers = {
+        80:  'Pros Ventes',
+        100: 'Pros Locations',
+        120: 'Particuliers Ventes',
+        140: 'Particuliers Locations',
+    }
+    # Verify these are indeed TOTAL rows
+    for expected_row, label in section_headers.items():
+        b = ws411.cell(expected_row, 2).value
+        if b and str(b).strip().upper() == 'TOTAL':
+            section_total_rows[label] = expected_row
+
+    pros_vte_row = section_total_rows.get('Pros Ventes')
+    pros_loc_row = section_total_rows.get('Pros Locations')
+    if not pros_vte_row or not pros_loc_row: return checks
+
+    # 1.1 site row mapping in Annonces Ancien section (rows ~27-44)
+    site_row_11 = {}
+    for r in range(24, 50):
+        b = ws11.cell(r, 2).value
+        if b and isinstance(b, str):
+            name = ALIAS_11.get(b.strip(), b.strip())
+            if name in SITES:
+                site_row_11[name] = r
+
+    # Per site: 4.1.1 Pros Ventes + Locations = 1.1 Ancien Pros
+    errors = []
+    ok_count = 0
+    for site in SITES:
+        col_411 = site_col_411.get(site)
+        row_11  = site_row_11.get(site)
+        if col_411 is None or row_11 is None: continue
+
+        v_vte = ws411.cell(pros_vte_row, col_411).value or 0
+        v_loc = ws411.cell(pros_loc_row, col_411).value or 0
+        v_sum = float(v_vte) + float(v_loc)
+        v_11  = float(ws11.cell(row_11, lc1).value or 0)
+
+        if v_sum == v_11:
+            ok_count += 1
+        else:
+            errors.append(
+                f"{site}: 4.1.1 Ventes({fmt(v_vte)})+Loc({fmt(v_loc)})={fmt(v_sum)} ≠ 1.1={fmt(v_11)} (diff={fmt(abs(v_sum-v_11))})"
+            )
+
+    if errors:
+        checks.append(check(
+            f"[tab 4.1.1 contrôle tab 1] 4.1.1 Pros Ventes+Locations = 1.1 Ancien Pros par site ({lm})",
+            False,
+            "❌ " + " | ".join(errors[:4]) + (f" +{len(errors)-4} autres" if len(errors) > 4 else "")
+            + " → Vérifier les fichiers 4.1 et 1",
+            "error", "tab 4.1.1 — contrôle tab 1-4 (rows 171/193/215/237)"
+        ))
+    elif ok_count > 0:
+        checks.append(check(
+            f"[tab 4.1.1 contrôle tab 1] 4.1.1 Pros Ventes+Locations = 1.1 Ancien Pros par site ({lm})",
+            True,
+            f"✅ {ok_count} sites cohérents.",
+            "error", "tab 4.1.1 — contrôle tab 1-4 (rows 171/193/215/237)"
+        ))
+
+    # Total Dedup check (AO kontrolü)
+    td_vte = ws411.cell(pros_vte_row, 18).value or 0
+    td_loc = ws411.cell(pros_loc_row, 18).value or 0
+    td_sum = float(td_vte) + float(td_loc)
+    # 1.1 row 42 = 'Total Panel Dédupliqué Marché' Ancien Pros
+    td_11 = None
+    for r in range(38, 50):
+        b = ws11.cell(r, 2).value
+        if b and 'dédupliqué marché' in str(b).lower():
+            td_11 = ws11.cell(r, lc1).value; break
+
+    if td_11 is not None:
+        ok_td = (td_sum == float(td_11))
+        checks.append(check(
+            f"[tab 4.1.1 AO contrôle] Pros Ventes+Locations Total Dedup = 1.1 Total Dédupliqué Marché ({lm})",
+            ok_td,
+            (f"✅ Cohérent : {fmt(td_sum)}" if ok_td else
+             f"❌ 4.1.1 Pros Vtes({fmt(td_vte)})+Loc({fmt(td_loc)})={fmt(td_sum)} ≠ 1.1={fmt(td_11)} (diff={fmt(abs(td_sum-float(td_11)))})"),
+            "error", "tab 4.1.1 — contrôle tab 1-4 (rows 171/193/215/237)"
+        ))
+
+    return checks
+    """
+    tab 5-2 (Grand Ouest) — MAX(sites) <= Total Dédupliqué per département
+    Panel Checker: =MAX(B460,...,F460)<=G460 — Vendée/Finistère/Maine-et-Loire hataları
+    """
+    checks = []
+    try:
+        wb52 = load_workbook(io.BytesIO(wb52_bytes), data_only=True)
+    except Exception:
+        return checks
+
+    for sn in wb52.sheetnames:
+        if sn.lower() == 'intro': continue
+        ws = wb52[sn]
+        lc, lm = get_lc(ws)
+        if not lc: continue
+
+        # Kolonlar: B=site1, C=site2,... dernier col avant Dédup = sites, son col = Dédup
+        # Header row 2'de "Total" ya da "Dédupliqué" içeren kolon = dedup_col
+        dedup_col = None
+        site_cols = []
+        for c in range(2, min(ws.max_column+1, 15)):
+            h = ws.cell(2, c).value or ws.cell(1, c).value
+            if not h: continue
+            if isinstance(h, str) and ('dédup' in h.lower() or 'total' in h.lower()):
+                dedup_col = c; break
+            site_cols.append(c)
+
+        if not site_cols or not dedup_col: continue
+
+        violations = []
+        for r in range(3, ws.max_row+1):
+            label = ws.cell(r, 1).value
+            if not label or not isinstance(label, str): continue
+            if any(x in str(label).upper() for x in ['TOTAL', 'SITE']): continue
+
+            site_vals = [ws.cell(r, c).value for c in site_cols
+                        if isinstance(ws.cell(r, c).value, (int, float)) and ws.cell(r, c).value > 0]
+            dedup_val = ws.cell(r, dedup_col).value
+
+            if site_vals and isinstance(dedup_val, (int, float)) and dedup_val > 0:
+                max_val = max(site_vals)
+                if max_val > dedup_val:
+                    violations.append(f"{str(label).strip()} (MAX={fmt(max_val)} > Dédup={fmt(dedup_val)})")
+
+        if violations:
+            checks.append(check(
+                f"[tab 5-2] MAX(sites) ≤ Total Dédupliqué — {sn} ({lm})",
+                False,
+                f"❌ {len(violations)} département(s) : {', '.join(violations[:5])}"
+                + (f" +{len(violations)-5}" if len(violations) > 5 else "")
+                + " → Vérifier la déduplication dans le fichier 5.2",
+                "error", "tab 5-2 — contrôle MAX déduplication"
+            ))
+        elif lm and site_cols:
+            checks.append(check(
+                f"[tab 5-2] MAX(sites) ≤ Total Dédupliqué — {sn} ({lm})",
+                True, "✅ Tous les départements sont cohérents.", "error",
+                "tab 5-2 — contrôle MAX déduplication"
+            ))
+
+    return checks
+
+
+def check_tab5_max(wb5_bytes):
+    """
+    tab 5 (Focus IDF & Alpes-Maritimes) — MAX(sites) <= Total Dédupliqué per arrondissement
+    Panel Checker: =MAX(C590,D590,E590,F590)<=G590 — 5ème et 13ème arr. en erreur
+    """
+    checks = []
+    try:
+        wb5 = load_workbook(io.BytesIO(wb5_bytes), data_only=True)
+    except Exception:
+        return checks
+
+    for sn in wb5.sheetnames:
+        if sn.lower() == 'intro': continue
+        ws = wb5[sn]
+        lc, lm = get_lc(ws)
+        if not lc: continue
+
+        dedup_col = None
+        site_cols = []
+        for c in range(2, min(ws.max_column+1, 12)):
+            h = ws.cell(2, c).value or ws.cell(1, c).value
+            if not h: continue
+            if isinstance(h, str) and ('dédup' in h.lower() or 'dedup' in h.lower()):
+                dedup_col = c; break
+            if isinstance(h, str) and h.strip() not in ('', 'Site', 'Arrondissement'):
+                site_cols.append(c)
+
+        if not site_cols or not dedup_col: continue
+
+        violations = []
+        for r in range(3, ws.max_row+1):
+            label = ws.cell(r, 1).value or ws.cell(r, 2).value
+            if not label or not isinstance(label, str): continue
+            label_str = str(label).strip()
+            if any(x in label_str.upper() for x in ['TOTAL', 'SITE', 'RÉGION']): continue
+            if not any(c.isdigit() for c in label_str): continue
+
+            site_vals = [ws.cell(r, c).value for c in site_cols
+                        if isinstance(ws.cell(r, c).value, (int, float)) and ws.cell(r, c).value > 0]
+            dedup_val = ws.cell(r, dedup_col).value
+
+            if site_vals and isinstance(dedup_val, (int, float)) and dedup_val > 0:
+                max_val = max(site_vals)
+                if max_val > dedup_val:
+                    violations.append(f"{label_str} (MAX={fmt(max_val)} > Dédup={fmt(dedup_val)})")
+
+        if violations:
+            checks.append(check(
+                f"[tab 5] MAX(sites) ≤ Total Dédupliqué — {sn} ({lm})",
+                False,
+                f"❌ {len(violations)} arrondissement(s) : {', '.join(violations[:5])}"
+                + " → Vérifier la déduplication dans le fichier 5",
+                "error", "tab 5 — contrôle MAX déduplication"
+            ))
+        elif lm and site_cols:
+            checks.append(check(
+                f"[tab 5] MAX(sites) ≤ Total Dédupliqué — {sn} ({lm})",
+                True, "✅ Tous les arrondissements sont cohérents.", "error",
+                "tab 5 — contrôle MAX déduplication"
+            ))
+
+    return checks
+
+
 # ─── MAIN RUNNER ─────────────────────────────────────────────────────────────
 
 def classify_files(uploaded_files):
@@ -675,6 +925,14 @@ def run_all_qc_gold(uploaded_files):
     # tab 5 × tab 3.2 — Alpes-Maritimes cross-check
     if 'file5' in files_bytes and 'file3_2' in files_bytes:
         all_checks += check_tab5_vs_tab32(files_bytes['file5'], files_bytes['file3_2'])
+    # tab 4.1.1 × tab 1 — contrôle tab 1-4 (rows 171/193/215/237, hardcoded False dans Panel Checker)
+    if 'file4_1' in files_bytes and 'file1' in files_bytes:
+        all_checks += check_tab411_vs_tab1(files_bytes['file4_1'], files_bytes['file1'])
+    if 'file5' in files_bytes:
+        all_checks += check_tab5_max(files_bytes['file5'])
+    # tab 5-2 — MAX(sites) <= Dédupliqué par département (Grand Ouest)
+    if 'file5_2' in files_bytes:
+        all_checks += check_tab52_max(files_bytes['file5_2'])
 
     return all_checks, files_bytes
 
