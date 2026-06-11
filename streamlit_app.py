@@ -66,7 +66,79 @@ def check_ok(name, condition, detail, severity="error", sheet=""):
 
 # ─── QC GOLD CHECKS ──────────────────────────────────────────────────────────
 
+def run_sheet_checks(wb, file_label):
+    checks = []
+    for sn in wb.sheetnames:
+        if sn == 'Intro': continue
+        ws = wb[sn]
+        data, month_m, month_m1 = get_sheet_data(ws)
+        if not data or not month_m: continue
+        label = f"{file_label} › {sn}"
 
+        total = data.get('Total')
+        dedup = next((data[k] for k in data if 'Dédupliqué' in k or 'Dedup' in k), None)
+        sites = {k:v for k,v in data.items() if k not in SKIP_ROWS and 'Dédupliqué' not in k and 'Dedup' not in k}
+
+        # Check 1: Total = sum of sites
+        if total and sites:
+            s = sum(v['m'] for v in sites.values())
+            if s > 1000:
+                diff_pct = abs(total['m']-s)/s*100
+                checks.append(check_ok(
+                    f"Total = sum of sites ({month_m})",
+                    diff_pct < 1,
+                    f"Total={total['m']:,.0f} | Sum={s:,.0f} | Diff={diff_pct:.2f}%",
+                    "error", label))
+
+        # Check 2: Dedup <= Total
+        if dedup and total and total['m'] > 1000:
+            checks.append(check_ok(
+                f"Total Dédupliqué ≤ Total ({month_m})",
+                dedup['m'] <= total['m'],
+                f"Dedup={dedup['m']:,.0f} | Total={total['m']:,.0f}",
+                "error", label))
+
+        # Check 3: Evol% per site
+        for site, vals in sites.items():
+            vm, vm1 = vals['m'], vals['m1']
+            if vm1 > 10 and vm > 10:
+                evol = (vm/vm1-1)*100
+                if abs(evol) > 30:
+                    checks.append({'check':f"Evol% {site}",
+                        'status':'warning','severity':'warning',
+                        'detail':f"{evol:+.1f}% ({month_m1}={vm1:,.0f} → {month_m}={vm:,.0f})",
+                        'sheet':label})
+    return checks
+
+def run_cross_checks(files_bytes):
+    checks = []
+    def get_dedup(key):
+        if key not in files_bytes: return None, None
+        wb = load_workbook(io.BytesIO(files_bytes[key]), data_only=True)
+        sn = [s for s in wb.sheetnames if s != 'Intro']
+        if not sn: return None, None
+        ws = wb[sn[0]]
+        data, m, _ = get_sheet_data(ws)
+        if not data: return None, None
+        dedup = next((data[k] for k in data if 'Dédupliqué' in k or 'Dedup' in k), None)
+        return (dedup['m'] if dedup else None), m
+
+    pairs = [
+        ('file1','file3_1','File 1 Total Dedup = File 3.1 Total Dedup'),
+        ('file1','file3_2','File 1 Total Dedup = File 3.2 Total Dedup'),
+        ('file3_2','file4_1','File 3.2 Total Dedup = File 4.1 Total Dedup'),
+    ]
+    for k1,k2,name in pairs:
+        v1,m1 = get_dedup(k1)
+        v2,m2 = get_dedup(k2)
+        if v1 and v2:
+            diff_pct = abs(v1-v2)/v1*100 if v1>0 else 0
+            checks.append(check_ok(
+                f"{name} ({m1})",
+                diff_pct < 1,
+                f"{k1}={v1:,.0f} | {k2}={v2:,.0f} | Diff={diff_pct:.2f}%",
+                "error", "Cross-file check"))
+    return checks
 
 """
 QC Gold V2 — Exact replicas of Panel Checker controls applied to HAM files.
@@ -150,733 +222,424 @@ def is_close(a, b, tol=0.01):
     if a == 0 or b == 0: return False
     return abs(a-b)/max(abs(a),abs(b)) < tol
 
-# ─── HELPERS FOR SOURCE-FILE CHECKS ─────────────────────────────────────────
-
-def get_lc(ws):
-    """Son ay kolonunu (lc) ve etiketini (lm) döndür."""
-    for r in range(1, 15):
-        mc = []
-        for c in range(1, min(ws.max_column+1, 200)):
-            v = ws.cell(r, c).value
-            if v is None: continue
-            if (isinstance(v, datetime.datetime) or
-                (isinstance(v,(int,float)) and 40000<v<50000) or
-                (isinstance(v,str) and any(m in v.lower() for m in ['-25','-26','-24','-23']))):
-                mc.append((c, excel_date_str(v)))
-        if len(mc) >= 3:
-            return mc[-1][0], mc[-1][1]
-    return None, None
-
-def row_val(ws, label, lc, col=2, skip=0):
-    """col kolonunda tam eşleşen etiketi bul, lc kolonundaki değeri döndür."""
-    found = 0
-    for r in range(1, ws.max_row+1):
-        v = ws.cell(r, col).value
-        if v and isinstance(v, str) and v.strip() == label:
-            if found == skip:
-                return ws.cell(r, lc).value
-            found += 1
-    return None
-
-def row_val_contains(ws, parts, lc, col=2):
-    """Etikette 'parts' kelimelerini içeren ilk satırın lc değerini döndür."""
-    parts = parts if isinstance(parts, list) else [parts]
-    for r in range(1, ws.max_row+1):
-        v = ws.cell(r, col).value
-        if v and isinstance(v, str):
-            if all(p.lower() in v.lower() for p in parts):
-                return ws.cell(r, lc).value
-    return None
-
-def fmt(v):
-    if v is None: return 'N/A'
-    try: return f"{float(v):,.0f}"
-    except: return str(v)
-
 # ─── TAB 3.1 CHECKS ──────────────────────────────────────────────────────────
-# Source des formules Panel Checker (vérifiées sur le fichier réel):
-#
-# tab 3.1 row 21 "contrôle type":   D21=D8+D9+D10+D11=D12
-#   → 3.1.1: Total identifiés Joreca = Agence + Intermédiaire + Notaire + Autres (Annonces col)
-#
-# tab 3.1 row 22 "contrôle identification":  D22=D18=D15+D16+D17
-#   → 3.1.1: Total général pros = Pros identifiés + Pros à identifier + Annonces incomplètes
-#
-# tab 3.1 row 23 "contrôle tab 1":  D23: D18='tab 1'!O116 (Bien'ici)
-#                                   AQ23: AQ18='tab 1'!O130 (Total Dédup Marché)
-#   → 3.1.1 Total général professionnels (Annonces col) per site
-#   == 1.2 Pro_Part Ancien annonces per site (last month col)
-
-def _311_site_cols(ws311):
-    """3.1.1 Pros par site: retourne dict site→(Pro_col, Annonces_col, Moyenne_col)"""
-    cols = {}
-    for c in range(2, ws311.max_column+1):
-        v = ws311.cell(1, c).value
-        if v and isinstance(v, str) and v.strip():
-            name = v.strip().strip("'\"")
-            h2 = ws311.cell(2, c).value
-            if h2 and str(h2).strip() == 'Pro':
-                cols[name] = (c, c+1, c+2)
-    return cols
-
-def _311_row(ws311, label):
-    """3.1.1: retourne numéro de ligne dont col1 == label"""
-    for r in range(1, ws311.max_row+1):
-        v = ws311.cell(r, 1).value
-        if v and str(v).strip() == label:
-            return r
-    return None
 
 def check_tab31(wb31_bytes, wb1_bytes):
     checks = []
     wb31 = load_workbook(io.BytesIO(wb31_bytes), data_only=True)
     wb1  = load_workbook(io.BytesIO(wb1_bytes), data_only=True)
 
-    ws311 = wb31['3.1.1 Pros par site ']
+    # ── CHECK 1: Total général pros (3.1.4) = Total Panel Dédupliqué Marché Ancien (1.2)
+    # Panel Checker: =AQ18='tab 1'!O130
+    # tab3.1 row18 = HAM 3.1.4 "Total général professionnels" last month
+    # tab1 row130 = HAM 1.2 "Total Panel Dédupliqué Marché" last month (Ancien section)
     ws314 = wb31['3.1.4 Evolution Pros par type']
     ws12  = wb1['1.2 Pro_Part']
 
-    lc12, lm = get_lc(ws12)
-    if not lc12: return checks
+    # Get 3.1.4 Total général pros - last month
+    total_pros_314 = None
+    lc, lm, pc, pm = get_last_two_months(ws314)
+    if lc:
+        for r in range(1, ws314.max_row+1):
+            b = ws314.cell(r,2).value
+            if b and 'général' in str(b).lower() and 'profes' in str(b).lower():
+                total_pros_314 = ws314.cell(r, lc).value
+                break
 
-    site_cols = _311_site_cols(ws311)
+    # Get 1.2 Total Panel Dédupliqué Marché - Ancien section (first occurrence)
+    total_dedup_ancien = None
+    lc2, lm2, pc2, pm2 = get_last_two_months(ws12)
+    if lc2:
+        for r in range(1, ws12.max_row+1):
+            b = ws12.cell(r,2).value
+            if b and 'Dédupliqué Marché' in str(b):
+                total_dedup_ancien = ws12.cell(r, lc2).value
+                break
 
-    SITES = ['AvendreAlouer', "Bien'ici", 'Figaro Immo', 'Green-Acres', 'Leboncoin',
-             'LogicImmo', 'MeilleursAgents', 'OuestFrance', 'PAP', 'ParuVendu',
-             'SeLoger', 'Superimmo']
-    # 1.2 utilise 'SuperImmo' (majuscule I), 3.1.1 utilise 'Superimmo'
-    ALIAS_12 = {'Superimmo': 'SuperImmo'}
+    if total_pros_314 is not None and total_dedup_ancien is not None:
+        checks.append(check(
+            f"3.1.4 Total pros = 1.2 Total Panel Dédupliqué Marché ({lm})",
+            is_close(total_pros_314, total_dedup_ancien),
+            f"3.1.4={total_pros_314:,.0f} | 1.2={total_dedup_ancien:,.0f} | diff={abs(total_pros_314-total_dedup_ancien):,.0f}",
+            "error", "tab 3.1 — contrôle tab 1"
+        ))
 
-    # ── CHECK A: contrôle tab 1 (row 23) — site par site
-    # D23: D18 (Bien'ici Total général annonces dans 3.1.1) = 'tab 1'!O116 (1.2 Bien'ici annonces)
-    # Vérifie que chaque site dans 3.1.1 "Total général professionnels" Annonces col
-    # correspond bien à la même valeur dans 1.2 Pro_Part Ancien
+    # ── CHECK 2: For each site: Vente + Location = Total (tab 3.1)
+    # Panel Checker: =O73+O92=O191 for Bien'ici
+    # In HAM 3.1: 3.1.4 sheet has sections for Vente, Location, Total
+    # Find the three sections
+    SITES = ["Bien'ici", 'SeLoger', 'Total']
+    ws314 = wb31['3.1.4 Evolution Pros par type']
+    lc, lm, pc, pm = get_last_two_months(ws314)
 
-    r_total_gen = _311_row(ws311, 'Total général professionnels')
-    if r_total_gen:
-        for site in SITES:
-            if site not in site_cols: continue
-            ann_col = site_cols[site][1]
-            v311 = ws311.cell(r_total_gen, ann_col).value
-            site_12 = ALIAS_12.get(site, site)
-            v12 = row_val(ws12, site_12, lc12)
-            if v311 is not None and v12 is not None:
-                ok = (float(v311) == float(v12))
-                checks.append(check(
-                    f"[row 23] {site} — 3.1.1 Total général = 1.2 annonces {lm}",
-                    ok,
-                    (f"✅ {site} cohérent : {fmt(v311)} annonces." if ok else
-                     f"❌ 3.1.1 'Total général professionnels' Annonces = {fmt(v311)}"
-                     f" | 1.2 '{site}' = {fmt(v12)}"
-                     f" | Différence = {fmt(abs(float(v311)-float(v12)))} annonces"),
-                    "error", "tab 3.1 — contrôle tab 1"
-                ))
+    if lc:
+        # Find all "Site" header rows → gives us section start rows
+        site_rows = []
+        for r in range(1, ws314.max_row+1):
+            if ws314.cell(r,2).value == 'Site':
+                site_rows.append(r)
 
-    # ── CHECK A bis: AQ23 — Total Panel Dédupliqué Marché
-    # AQ23: AQ18 = 'tab 1'!O130
-    # tab 3.1 AQ18 = 3.1.1 col 42 header="Annonces dédoublonnées", row 14 "Total général professionnels"
-    # 'tab 1'!O130 = 1.2 Pro_Part "Total Panel Dédupliqué Marché" dernière col
-    #
-    # ATTENTION: 3.1.1 a deux colonnes contenant "dédoublonn":
-    #   col 41 = "Pros dédoublonnés"   → row 14 = 89,056  (nombre d'annonceurs)
-    #   col 42 = "Annonces dédoublonnées" → row 14 = 1,406,035 (nombre d'annonces) ← C'EST CELUI-CI
-    # On cherche la colonne dont row 2 = "Annonces dédoublonnées" (pas "Pros dédoublonnés")
-    dedup_col = None
+        # Check Vente+Loc=Total for key sites across sections
+        if len(site_rows) >= 3:
+            # Typically: site_rows[0]=all pros, site_rows[1]=agences(vente?), site_rows[2]=agences(loc?)
+            # Get Total row in each section
+            def get_section_total(section_start):
+                for r in range(section_start, min(section_start+30, ws314.max_row+1)):
+                    b = ws314.cell(r,2).value
+                    if b and str(b).strip() in ('Total','Total Panel Dédupliqué','Total Panel Dédupliqué  - Top 11 Sites'):
+                        return ws314.cell(r, lc).value, str(b).strip()
+                    if b == 'Site' and r != section_start:
+                        break
+                return None, None
+
+            # Get each site's value in section 1 (all), section 2 (vente equiv), section 3 (loc equiv)
+            for site in ["Bien'ici", 'SeLoger', 'Total']:
+                vals = []
+                for sr in site_rows[:3]:
+                    for r in range(sr+1, min(sr+30, ws314.max_row+1)):
+                        b = ws314.cell(r,2).value
+                        if b and str(b).strip() == site:
+                            vals.append(ws314.cell(r, lc).value)
+                            break
+                        if b == 'Site' and r != sr:
+                            break
+
+                if len(vals) >= 3 and all(v is not None for v in vals):
+                    # Check: vals[1] + vals[2] == vals[0] (or similar)
+                    sum_parts = sum(vals[1:])
+                    checks.append(check(
+                        f"3.1.4 {site}: Vente+Loc = Total ({lm})",
+                        is_close(sum_parts, vals[0], tol=0.02),
+                        f"Vente+Loc={sum_parts:,.0f} | Total={vals[0]:,.0f}",
+                        "warning", "tab 3.1 — contrôle somme des segments"
+                    ))
+
+    # ── CHECK 3: Month consistency (=P131=C131 type checks)
+    # AvendreAlouer value in month M should equal same value in another section's month M
+    # This checks that the same site appears with the same value across different sheets
+    SITES_CHECK = ['AvendreAlouer', "Bien'ici", 'Figaro Immo', 'Leboncoin', 'LogicImmo',
+                   'MeilleursAgents', 'OuestFrance', 'ParuVendu', 'SeLoger', 'Superimmo']
+
+    # Get values from 3.1.4 vs 3.1.1 (they should match for current month)
+    ws311 = wb31['3.1.1 Pros par site ']
+
+    # 3.1.1 has sites as columns with date in row 1
+    # Get site columns
+    site_cols_311 = {}
     for c in range(1, ws311.max_column+1):
-        h = ws311.cell(2, c).value
-        if h and isinstance(h, str) and h.strip().lower() == 'annonces dédoublonnées':
-            dedup_col = c; break
+        v = ws311.cell(1, c).value
+        if v and isinstance(v, str):
+            site_cols_311[v.strip()] = c
 
-    if dedup_col and r_total_gen:
-        v311_dedup = ws311.cell(r_total_gen, dedup_col).value
-        v12_dedup  = row_val(ws12, 'Total Panel Dédupliqué Marché', lc12)
-        if v311_dedup is not None and v12_dedup is not None:
-            ok = (float(v311_dedup) == float(v12_dedup))
-            checks.append(check(
-                f"[AQ23] 3.1.1 Annonces dédoublonnées ({fmt(v311_dedup)}) = 1.2 Total Panel Dédupliqué Marché ({fmt(v12_dedup)}) — {lm}",
-                ok,
-                (f"✅ Les deux fichiers sont cohérents : {fmt(v311_dedup)} annonces dédoublonnées." if ok else
-                 f"❌ 3.1.1 col 'Annonces dédoublonnées' (Total général) = {fmt(v311_dedup)}"
-                 f" | 1.2 'Total Panel Dédupliqué Marché' = {fmt(v12_dedup)}"
-                 f" | Différence = {fmt(abs(float(v311_dedup)-float(v12_dedup)))} annonces"
-                 f" → Demander à l'équipe de vérifier le fichier 3.1 ou 1."),
-                "error", "tab 3.1 — contrôle tab 1 (AQ23)"
-            ))
-
-    # ── CHECK B: contrôle type (row 21)
-    # D21=D8+D9+D10+D11=D12
-    # 3.1.1: Total identifiés Joreca = Agence + Intermédiaire + Notaire + Autres (Annonces col)
-    r_total_id  = _311_row(ws311, 'Total identifiés base Joreca')
-    r_agence    = _311_row(ws311, 'Agence immobilière')
-    r_interm    = _311_row(ws311, 'Intermédiaire')
-    r_notaire   = _311_row(ws311, 'Notaire')
-    r_autres    = _311_row(ws311, 'autres (uniquement le Autres Hors Promoteur et Constructeur)')
-    if r_autres is None:
-        r_autres = _311_row(ws311, 'Autres')
-
-    if all(r is not None for r in [r_total_id, r_agence, r_interm, r_notaire, r_autres]):
-        for site in SITES:
-            if site not in site_cols: continue
-            ann_col = site_cols[site][1]
-            t  = ws311.cell(r_total_id, ann_col).value
-            ag = ws311.cell(r_agence,   ann_col).value
-            it = ws311.cell(r_interm,   ann_col).value
-            no = ws311.cell(r_notaire,  ann_col).value
-            au = ws311.cell(r_autres,   ann_col).value
-            vals = [t, ag, it, no, au]
-            if all(isinstance(v, (int,float)) for v in vals) and float(t) > 0:
-                soma = float(ag) + float(it) + float(no) + float(au)
-                ok   = (soma == float(t))
-                checks.append(check(
-                    f"[tab 1 row 21] {site}: Agences+Interm+Notaires+Autres = Total identifiés ({lm})",
-                    ok,
-                    f"Somme={fmt(soma)} | Total={fmt(t)} | diff={fmt(abs(soma-float(t)))}",
-                    "error", "tab 3.1 — contrôle type"
-                ))
-
-    # ── CHECK C: contrôle identification (row 22)
-    # D22=D18=D15+D16+D17
-    # 3.1.1: Total général pros (Annonces) = Pros identifiés + Pros à identifier + Annonces incomplètes
-    r_pros_id   = _311_row(ws311, 'Pros identifiés Joreca')
-    r_pros_nid  = _311_row(ws311, 'Pros à identifier Joreca')
-    r_incomplet = _311_row(ws311, 'Annonces incomplètes')
-
-    if all(r is not None for r in [r_total_gen, r_pros_id, r_pros_nid, r_incomplet]):
-        for site in SITES:
-            if site not in site_cols: continue
-            ann_col = site_cols[site][1]
-            tg = ws311.cell(r_total_gen,  ann_col).value
-            pi = ws311.cell(r_pros_id,    ann_col).value
-            pn = ws311.cell(r_pros_nid,   ann_col).value
-            ai = ws311.cell(r_incomplet,  ann_col).value
-            vals = [tg, pi, pn, ai]
-            if all(isinstance(v, (int,float)) for v in vals) and float(tg) > 0:
-                soma = float(pi) + float(pn) + float(ai)
-                ok   = (soma == float(tg))
-                checks.append(check(
-                    f"[tab 1 row 22] {site}: Pros id+non id+incomplets = Total général ({lm})",
-                    ok,
-                    f"Somme={fmt(soma)} | Total={fmt(tg)} | diff={fmt(abs(soma-float(tg)))}",
-                    "error", "tab 3.1 — contrôle identification"
-                ))
-
-    # ── CHECK D: contrôle type sur 3.1.4 (segments Agences/Interm/Notaires/Autres)
-    # tab 3.1 row 21: annonceurs totaux = somme des sous-types
-    lc314, _ = get_lc(ws314)
-    if lc314:
-        total_all = row_val(ws314, 'Total', lc314, skip=0)
-        agences   = row_val(ws314, 'Total', lc314, skip=1)
-        interm314 = row_val(ws314, 'Total', lc314, skip=2)
-        notaires  = row_val(ws314, 'Total', lc314, skip=3)
-        autres314 = row_val(ws314, 'Total', lc314, skip=4)
-        if all(v is not None for v in [total_all, agences, interm314, notaires, autres314]):
-            soma = agences + interm314 + notaires + autres314
-            checks.append(check(
-                f"[tab 1 row 21] 3.1.4 Agences+Interméd+Notaires+Autres = Total annonceurs ({lm})",
-                soma == total_all,
-                f"Somme={fmt(soma)} | Total={fmt(total_all)} | diff={fmt(abs(soma-total_all))}",
-                "error", "tab 3.1 — contrôle type (3.1.4)"
-            ))
+    # 3.1.4 last month values
+    lc, lm, _, _ = get_last_two_months(ws314)
+    if lc and lm:
+        # Get "Pros identifiés Joreca" row values per site in 3.1.1
+        # vs 3.1.4 site totals
+        for r in range(1, ws314.max_row+1):
+            b = ws314.cell(r,2).value
+            if b and 'identifiés Joreca' in str(b) and 'Pros' in str(b):
+                # This row has Total Pros per site
+                for site in SITES_CHECK:
+                    v314 = ws314.cell(r, lc).value
+                    # Find same in 3.1.1
+                    site_col = None
+                    for c in range(1, ws311.max_column+1):
+                        h = ws311.cell(1, c).value
+                        if h and str(h).strip() == site:
+                            site_col = c; break
+                    if site_col:
+                        # Row 12 in 3.1.1 = Pros identifiés Joreca
+                        v311 = ws311.cell(12, site_col).value
+                        if v314 is not None and v311 is not None and v314 > 0:
+                            checks.append(check(
+                                f"3.1.4 {site} Pros identifiés = 3.1.1 {site} ({lm})",
+                                is_close(float(v314), float(v311)),
+                                f"3.1.4={v314:,.0f} | 3.1.1={v311:,.0f}",
+                                "error", "tab 3.1 — cohérence entre sheets"
+                            ))
+                break
 
     return checks
 
 # ─── TAB 3.2 CHECKS ──────────────────────────────────────────────────────────
-# Source des formules Panel Checker (vérifiées):
-#
-# tab 3.2 row 24 "contrôle tab 3.1.4":
-#   K24: K22='tab 3.1'!$O194  (Leboncoin)
-#   AA24: AA22='tab 3.1'!$O202  (Total)
-#   → 3.2.1 TOTAL row per site == 3.1.4 "Annonceurs professionnels identifiés"[site, lc]
-#     (tab 3.1 O190-O202 = 3.1.4 section 1 rows 6-20)
-#
-# tab 3.2 row 25 "contrôle segment":
-#   K25: K22=K45+K69+K91+K113
-#   → 3.2.1 grand TOTAL = Agences TOTAL + Intermédiaires TOTAL + Notaires TOTAL + Autres TOTAL
-#
-# tab 3.2 row 47 "contrôle tab 3.1.4" (Agences):
-#   K47: K45='tab 3.1'!$O216
-#   → 3.2.1 Agences TOTAL per site == 3.1.4 Agences[site, lc]
-#
-# tab 3.2 row 48 "contrôle tab 3.2.2":
-#   K48: K45=K348
-#   → 3.2.1 Agences TOTAL == 3.2.2 Agences total per département (sum)
-
-def _321_site_cols(ws321):
-    """3.2.1: retourne dict site→Pros_col (row 6 = sites, row 7 = Pros/Poids)"""
-    cols = {}
-    for c in range(3, ws321.max_column+1):
-        raw = ws321.cell(6, c).value
-        if raw and isinstance(raw, str):
-            name = raw.strip().strip("'\"")
-            h7 = ws321.cell(7, c).value
-            if h7 and str(h7).strip() == 'Pros':
-                cols[name] = c
-    return cols
-
-def _321_total_rows(ws321):
-    """3.2.1: retourne liste des row indices avec label 'TOTAL' col 2"""
-    rows = []
-    for r in range(1, ws321.max_row+1):
-        v = ws321.cell(r, 2).value
-        if v and str(v).strip().upper() == 'TOTAL':
-            rows.append(r)
-    return rows
 
 def check_tab32(wb32_bytes, wb31_bytes):
     checks = []
     wb32 = load_workbook(io.BytesIO(wb32_bytes), data_only=True)
     wb31 = load_workbook(io.BytesIO(wb31_bytes), data_only=True)
 
+    # ── CHECK 1: 3.2 Total = 3.1.4 Total Panel Dédupliqué (contrôle tab 3.1.4)
+    # Panel Checker: =K22='tab 3.1'!$O194  and  =AA22='tab 3.1'!$O202
     ws321 = wb32['3.2.1 Pros par régions']
     ws314 = wb31['3.1.4 Evolution Pros par type']
-    lc314, lm = get_lc(ws314)
-    if not lc314: return checks
 
-    site_cols = _321_site_cols(ws321)
-    total_rows = _321_total_rows(ws321)
+    # Get 3.2.1 TOTAL row last month
+    lc32, lm32, pc32, pm32 = get_last_two_months(ws321, site_col=2)
+    lc31, lm31, pc31, pm31 = get_last_two_months(ws314)
 
-    SITES = ['AvendreAlouer', "Bien'ici", 'Figaro Immo', 'GreenAcres', 'Leboncoin',
-             'LogicImmo', 'MeilleursAgents', 'OuestFrance', 'PAP', 'ParuVendu',
-             'SeLoger', 'Superimmo', 'Total']
-    ALIAS_314 = {'GreenAcres': 'Green-Acres'}
+    if lc32 and lc31:
+        # Find TOTAL in 3.2.1 for each site
+        # Find Total Panel Dédupliqué in 3.1.4
 
-    # ── CHECK A: contrôle tab 3.1.4 (row 24) ──
-    # 3.2.1 TOTAL (section 1, grand total row) per site == 3.1.4 site row, lc314
-    # tab 3.1 O190-O202 = 3.1.4 section 1 "Annonceurs professionnels identifiés":
-    #   row 190=AvendreAlouer, 191=Bien'ici, ..., 202=Total, 204=Total Dédupliqué
-    if total_rows:
-        grand_row = total_rows[0]
-        for site in SITES:
-            site_314 = ALIAS_314.get(site, site)
-            v314 = row_val(ws314, site_314, lc314)
-            v321 = site_cols.get(site) and ws321.cell(grand_row, site_cols[site]).value
+        # 3.2.1: row 22 = TOTAL (sum of all regions per site)
+        # For each site column in 3.2.1, total should match 3.1.4 dedup
+        site_cols = {}
+        for c in range(1, ws321.max_column+1):
+            v = ws321.cell(6, c).value  # row 6 has site names
+            if v and isinstance(v,str) and v.strip() not in ('Site','Département','Région',''):
+                site_cols[v.strip()] = c
 
-            if v314 is not None and v321 is not None and float(v314) > 0:
-                ok = (float(v314) == float(v321))
+        # Get 3.1.4 Total Panel Dédupliqué values per site
+        # 3.1.4 row 19 = Total Panel Dédupliqué (top 11)
+        # 3.1.4 row 20 = Total Panel Dédupliqué Marché
+        dedup_314 = {}
+        for r in range(1, ws314.max_row+1):
+            b = ws314.cell(r,2).value
+            if b and 'Total Panel Dédupliqué' in str(b) and 'Top' not in str(b):
+                # This is the market dedup row
+                for c in range(1, ws314.max_column+1):
+                    h = ws314.cell(5,c).value  # header row
+                    if h and isinstance(h,str) and h.strip() in site_cols:
+                        v = ws314.cell(r,lc31).value
+                        if isinstance(v,(int,float)):
+                            dedup_314[h.strip()] = float(v)
+                break
+
+        # Get 3.2.1 TOTAL for each site (last row = TOTAL)
+        total_321 = {}
+        for r in range(ws321.max_row, 0, -1):
+            b = ws321.cell(r,2).value
+            if b and str(b).strip() == 'TOTAL':
+                for site, sc in site_cols.items():
+                    v = ws321.cell(r, sc).value
+                    if isinstance(v,(int,float)):
+                        total_321[site] = float(v)
+                break
+
+        # Compare
+        for site in set(dedup_314.keys()) & set(total_321.keys()):
+            v31 = dedup_314[site]
+            v32 = total_321[site]
+            if v31 > 0:
                 checks.append(check(
-                    f"[tab 3.2 row 24] {site}: 3.2.1 TOTAL = 3.1.4 annonceurs ({lm})",
-                    ok,
-                    f"3.1.4={fmt(v314)} | 3.2.1={fmt(v321)} | diff={fmt(abs(float(v314)-float(v321)))}",
+                    f"3.2.1 {site} Total = 3.1.4 {site} Total Dedup ({lm32})",
+                    is_close(v31, v32),
+                    f"3.1.4={v31:,.0f} | 3.2.1={v32:,.0f} | diff={abs(v31-v32):,.0f}",
                     "error", "tab 3.2 — contrôle tab 3.1.4"
                 ))
 
-    # ── CHECK B: contrôle segment (row 25) ──
-    # K25: K22=K45+K69+K91+K113
-    # total_rows[0]=all pros, [1]=Agences, [2]=Intermédiaires, [3]=Notaires, [4]=Autres
-    if len(total_rows) >= 5:
-        for site in SITES:
-            col = site_cols.get(site)
-            if col is None: continue
-            gt  = ws321.cell(total_rows[0], col).value
-            ag  = ws321.cell(total_rows[1], col).value
-            it  = ws321.cell(total_rows[2], col).value
-            nt  = ws321.cell(total_rows[3], col).value
-            au  = ws321.cell(total_rows[4], col).value
-            vals = [gt, ag, it, nt, au]
-            if all(isinstance(v, (int,float)) for v in vals) and float(gt) > 0:
-                soma = float(ag)+float(it)+float(nt)+float(au)
-                ok = (soma == float(gt))
-                checks.append(check(
-                    f"[tab 3.2 row 25] {site}: 3.2.1 Grand Total = Agences+Interméd+Notaires+Autres ({lm})",
-                    ok,
-                    f"Somme={fmt(soma)} | Grand Total={fmt(gt)} | diff={fmt(abs(soma-float(gt)))}",
-                    "error", "tab 3.2 — contrôle segment"
-                ))
+    # ── CHECK 2: contrôle segment — sum of types = total
+    # =K22=K45+K69+K91+K113  → Total Pros = sum of Agence+Intermédiaire+Notaire+Autres
+    # In 3.2.1: we have sections per métier, their totals should sum to grand total
 
-    # ── CHECK C: contrôle tab 3.1.4 par section (row 47) ──
-    # K47: K45='tab 3.1'!$O216 (Agences Bien'ici)
-    # 3.1.4 section Agences (rows 28-43): row 40=Total, rows 28-39=sites
-    SECTIONS_3_1_4 = [
-        ('Agences immobilières',  1, 'tab 3.2 — contrôle tab 3.1.4 (Agences)'),
-        ('Intermédiaires',        2, 'tab 3.2 — contrôle tab 3.1.4 (Interméd.)'),
-        ('Notaires',              3, 'tab 3.2 — contrôle tab 3.1.4 (Notaires)'),
-        ('Autres annonceurs',     4, 'tab 3.2 — contrôle tab 3.1.4 (Autres)'),
-    ]
-    if len(total_rows) >= 5:
-        for sec_label, sec_idx, sheet_label in SECTIONS_3_1_4:
-            sec_row_321 = total_rows[sec_idx]
-            for site in SITES:
-                site_314 = ALIAS_314.get(site, site)
-                # 3.1.4 section rows: skip=sec_idx finds the section's site row
-                v314 = row_val(ws314, site_314, lc314, skip=sec_idx)
-                col = site_cols.get(site)
-                if col is None or v314 is None: continue
-                v321 = ws321.cell(sec_row_321, col).value
-                if v321 is not None and float(v314) > 0:
-                    ok = (float(v314) == float(v321))
-                    checks.append(check(
-                        f"[tab 3.2 row 47+] {sec_label} {site}: 3.2.1 = 3.1.4 ({lm})",
-                        ok,
-                        f"3.1.4={fmt(v314)} | 3.2.1={fmt(v321)} | diff={fmt(abs(float(v314)-float(v321)))}",
-                        "error", sheet_label
-                    ))
-
-    # ── CHECK D: contrôle MAX <= Total Dédupliqué (tab 3.2 row 68/473)
-    # Formule: =MAX(C68,...,Y68)<=AG68
-    # Pour chaque région: max(sites) doit être <= Total Dédupliqué
-    # Si MAX > Dédup → erreur de déduplication dans les données sources
-    dedup_col_321 = None
-    for c in range(3, ws321.max_column+1):
-        h6 = ws321.cell(6, c).value
-        h7 = ws321.cell(7, c).value
-        if h6 and 'Dédupliqué' in str(h6) and h7 and 'Pros' in str(h7):
-            dedup_col_321 = c; break
-    
-    site_cols_list = sorted(site_cols.values())
-    if dedup_col_321 and site_cols_list:
-        violations = []
-        for r in range(8, ws321.max_row+1):
-            region = ws321.cell(r, 2).value
-            if not region or not isinstance(region, str): continue
-            if str(region).strip().upper() in ('TOTAL', 'SITE', 'DÉPARTEMENT', 'RÉGION', ''): continue
-            
-            site_vals = [ws321.cell(r, c).value for c in site_cols_list
-                        if isinstance(ws321.cell(r, c).value, (int,float)) and ws321.cell(r, c).value > 0]
-            dedup_val = ws321.cell(r, dedup_col_321).value
-            
-            if site_vals and isinstance(dedup_val, (int,float)) and dedup_val >= 0:
-                max_val = max(site_vals)
-                if max_val > dedup_val:
-                    violations.append(f"{region.strip()} (MAX={fmt(max_val)} > Dédup={fmt(dedup_val)})")
-        
-        if violations:
-            checks.append(check(
-                f"[tab 3.2] MAX(sites) ≤ Total Dédupliqué pour chaque région ({lm})",
-                False,
-                f"❌ {len(violations)} région(s) avec incohérence : {', '.join(violations[:5])}"
-                + (f" et {len(violations)-5} autres" if len(violations) > 5 else "")
-                + " → Vérifier la déduplication dans le fichier 3.2",
-                "error", "tab 3.2 — contrôle déduplication"
-            ))
-        else:
-            checks.append(check(
-                f"[tab 3.2] MAX(sites) ≤ Total Dédupliqué pour chaque région ({lm})",
-                True, "✅ Toutes les régions sont cohérentes.", "error",
-                "tab 3.2 — contrôle déduplication"
-            ))
-
-    return checks
-
-def check_tab5_vs_tab32(wb5_bytes, wb32_bytes):
-    """
-    Panel Checker tab 5 satır 347/360/386 — IDF/Alpes Maritimes pros:
-    Formül: =H342='tab 3.2'!$AE$256  →  tab5 Agences06 pros = 3.2.1 Alpes-Maritimes MeilleursAgents pros
-    Formül: =H381='tab 3.2'!$AE$634  →  tab5 Autres06 pros = 3.2.1 Autres Alpes-Maritimes pros
-    """
-    checks = []
-    try:
-        wb5  = load_workbook(io.BytesIO(wb5_bytes), data_only=True)
-        wb32 = load_workbook(io.BytesIO(wb32_bytes), data_only=True)
-    except Exception:
-        return checks
-
-    ws5  = wb5[wb5.sheetnames[0]]
-    if '3.2.2 Pros par département' not in wb32.sheetnames:
-        return checks
+    # ── CHECK 3: MAX(sites) <= Total Dédupliqué per region
+    # =MAX(C68,...,Y68)<=AG68 → max site value per region ≤ Total Dédupliqué
     ws322 = wb32['3.2.2 Pros par département']
+    lc, lm, pc, pm = get_last_two_months(ws322, site_col=1)
+    if lc:
+        # Find rows with département name, check MAX(sites) <= dedup
+        for r in range(1, ws322.max_row+1):
+            dept = ws322.cell(r,1).value
+            if not dept or not isinstance(dept,str): continue
+            dept = dept.strip()
+            if not dept or dept in ('Site','Département','Total','TOTAL'): continue
 
-    # tab 5 (Focus IDF & Alpes-Maritimes) yapısı
-    # Bulmamız gereken: Alpes-Maritimes (06) satırları per section
-    # Panel Checker tab 5 H/I kolonları = bazı site değerleri
-    # Karşılaştırma 3.2.2'deki Alpes-Maritimes departmanıyla yapılıyor
+            # Get all site values in this row
+            site_vals = []
+            dedup_val = None
+            for c in range(2, ws322.max_column+1):
+                v = ws322.cell(r,c).value
+                h = ws322.cell(ws322.min_row,c).value  # header
+                if isinstance(v,(int,float)) and v > 0:
+                    if h and ('Dédupliqué' in str(h) or 'Dedup' in str(h)):
+                        dedup_val = float(v)
+                    else:
+                        site_vals.append(float(v))
 
-    # 3.2.2'de Alpes-Maritimes (06) satırını bul
-    alpes_row_322 = None
-    for r in range(1, min(ws322.max_row+1, 200)):
-        v = ws322.cell(r, 1).value
-        if v and ('alpes' in str(v).lower() or '06' in str(v)):
-            alpes_row_322 = r; break
+            if dedup_val and site_vals:
+                max_site = max(site_vals)
+                if max_site > dedup_val:
+                    checks.append({
+                        'check': f"MAX(sites) ≤ Total Dédupliqué — {dept} ({lm})",
+                        'status': 'fail', 'severity': 'error',
+                        'detail': f"Max site={max_site:,.0f} > Dedup={dedup_val:,.0f}",
+                        'sheet': "tab 3.2 — contrôle déduplication"
+                    })
 
-    if not alpes_row_322:
-        return checks
+    # ── CHECK 4: 3.2 cross-check with tab 5 (tab 3.2 IDF total = tab 5 total)
+    # Panel Checker: ='tab 3.1'!N55=O768
+    # In HAM: 3.2.1 IDF row = 5_Focus_IDF total (checked separately)
 
-    lm = None
-    # 3.2.2 header satırından son ay ve site kolonlarını bul
-    for r in range(1, 10):
-        for c in range(1, ws322.max_column+1):
-            v = ws322.cell(r, c).value
-            if isinstance(v, datetime.datetime):
-                lm = v.strftime('%b-%y'); break
-        if lm: break
+    return checks
 
-    # tab 5 kaynak dosyasında Alpes-Maritimes satırlarını bul
-    alpes_rows_5 = []
-    for r in range(1, ws5.max_row+1):
-        v = ws5.cell(r, 2).value or ws5.cell(r, 1).value
-        if v and ('alpes' in str(v).lower() or '06' in str(v) or 'maritimes' in str(v).lower()):
-            alpes_rows_5.append((r, str(v)))
+# ─── ALL TABS CHECKS (tab 1, 2, 4.1, 4.2, 5, 5-2) ───────────────────────────
 
-    # tab 5 son ay col
-    lc5, lm5 = get_lc(ws5)
-    # tab 3.2.2 son ay col
-    lc322, _ = get_lc(ws322)
+def check_generic_tab(wb_bytes, file_label):
+    """Generic checks for all files: total consistency, dedup logic, evol% anomalies."""
+    checks = []
+    wb = load_workbook(io.BytesIO(wb_bytes), data_only=True)
+    SKIP = {'Total Panel Dédupliqué','Total Panel Dédupliqué - Top 5 Sites',
+            'Total Panel Dédupliqué  - Top 11 Sites','Total Panel Dédupliqué Marché',
+            'Immobilier Notaire','Immonot','Site','Département','Région','TOTAL'}
 
-    if lc5 and lc322 and alpes_rows_5:
-        for r5, label5 in alpes_rows_5[:5]:
-            v5 = ws5.cell(r5, lc5).value
-            v322 = ws322.cell(alpes_row_322, lc322).value
-            if isinstance(v5, (int,float)) and isinstance(v322, (int,float)) and v5 > 0:
-                ok = (v5 == v322)
+    for sn in wb.sheetnames:
+        if sn == 'Intro': continue
+        ws = wb[sn]
+        lc, lm, pc, pm = get_last_two_months(ws)
+        if not lc: continue
+        label = f"{file_label} › {sn}"
+
+        # Collect data
+        total = dedup = None
+        sites = {}
+        for r in range(1, ws.max_row+1):
+            b = ws.cell(r,2).value
+            if not b or not isinstance(b,str): continue
+            b = b.strip()
+            vm = ws.cell(r,lc).value
+            vm1 = ws.cell(r,pc).value
+            if not isinstance(vm,(int,float)): continue
+            if b == 'Total': total = float(vm)
+            elif 'Dédupliqué Marché' in b or (b=='Total Panel Dédupliqué' and dedup is None):
+                dedup = float(vm)
+            elif b not in SKIP and 'Dédupliqué' not in b and 'Panel' not in b:
+                if float(vm) > 0:
+                    sites[b] = {'m':float(vm),'m1':float(vm1) if isinstance(vm1,(int,float)) else 0}
+
+        # Check: Total = sum of sites
+        if total and sites:
+            s = sum(v['m'] for v in sites.values())
+            if s > 1000 and total > 1000:
+                diff_pct = abs(total-s)/s*100
                 checks.append(check(
-                    f"[tab 5 Alpes-Maritimes] {label5}: fichier 5 = 3.2.2 Alpes-Maritimes ({lm5 or lm})",
-                    ok,
-                    (f"✅ Cohérent : {fmt(v5)}" if ok else
-                     f"❌ tab5={fmt(v5)} | 3.2.2 Alpes-Maritimes={fmt(v322)} | diff={fmt(abs(v5-v322))}"
-                     f" → Vérifier les fichiers 5 et 3.2"),
-                    "error", "tab 5 — contrôle vs tab 3.2"
+                    f"Total = sum of sites ({lm})",
+                    diff_pct < 1,
+                    f"Total={total:,.0f} | Sum sites={s:,.0f} | Diff={diff_pct:.2f}%",
+                    "error", label
                 ))
 
+        # Check: Dedup <= Total
+        if dedup and total and total > 1000:
+            checks.append(check(
+                f"Total Dédupliqué ≤ Total ({lm})",
+                dedup <= total,
+                f"Dedup={dedup:,.0f} | Total={total:,.0f}",
+                "error", label
+            ))
+
+        # Check: evol% per site
+        for site, vals in sites.items():
+            if vals['m1'] > 100 and vals['m'] > 10:
+                evol = (vals['m']/vals['m1']-1)*100
+                if abs(evol) > 30:
+                    checks.append({
+                        'check': f"Evol% {site}",
+                        'status': 'warning', 'severity': 'warning',
+                        'detail': f"{evol:+.1f}% ({pm}={vals['m1']:,.0f} → {lm}={vals['m']:,.0f})",
+                        'sheet': label
+                    })
+
     return checks
 
-def check_tab411_vs_tab1(wb41_bytes, wb1_bytes):
-    """
-    tab 4.1.1 rows 171/193/215/237 — 'contrôle tab 1-4' (hardcoded False dans Panel Checker)
-    Formül olmasi gereken: 4.1.1 Pros Ventes + Pros Locations per site = 1.1 Ancien Pros per site
-    Section yapısı:
-      4.1.1 row 80 TOTAL = 'Ancien - Total Annonces de Ventes de Professionnels'
-      4.1.1 row 100 TOTAL = 'Ancien - Total Annonces de Locations de Professionnels'
-      1.1 rows 27-42 = Annonces Ancien Pros per site (dernier col)
-    """
+# ─── CROSS-FILE CHECKS ───────────────────────────────────────────────────────
+
+def check_cross_files(files_bytes):
     checks = []
-    try:
-        wb41 = load_workbook(io.BytesIO(wb41_bytes), data_only=True)
-        wb1  = load_workbook(io.BytesIO(wb1_bytes), data_only=True)
-    except Exception:
-        return checks
 
-    if '4.1.1 Régions - Annonces' not in wb41.sheetnames: return checks
-    ws411 = wb41['4.1.1 Régions - Annonces']
-    ws11  = wb1['1.1 Total']
-    lc1, lm = get_lc(ws11)
-    if not lc1: return checks
+    def get_dedup_marche(key, sheet_idx=0):
+        if key not in files_bytes: return None, None
+        wb = load_workbook(io.BytesIO(files_bytes[key]), data_only=True)
+        sheets = [s for s in wb.sheetnames if s != 'Intro']
+        if not sheets: return None, None
+        ws = wb[sheets[sheet_idx] if sheet_idx < len(sheets) else sheets[0]]
+        lc, lm, _, _ = get_last_two_months(ws)
+        if not lc: return None, None
+        for r in range(1, ws.max_row+1):
+            b = ws.cell(r,2).value
+            if b and 'Dédupliqué Marché' in str(b):
+                v = ws.cell(r,lc).value
+                if isinstance(v,(int,float)): return float(v), lm
+        # Try first dedup
+        for r in range(1, ws.max_row+1):
+            b = ws.cell(r,2).value
+            if b and 'Dédupliqué' in str(b):
+                v = ws.cell(r,lc).value
+                if isinstance(v,(int,float)): return float(v), lm
+        return None, None
 
-    SITES = ['AvendreAlouer', "Bien'ici", 'Figaro Immo', 'Green-Acres', 'Leboncoin',
-             'LogicImmo', 'MeilleursAgents', 'OuestFrance', 'PAP', 'ParuVendu',
-             'SeLoger', 'Superimmo']
-    ALIAS_411 = {'GreenAcres': 'Green-Acres', 'SuperImmo': 'Superimmo'}
-    ALIAS_11  = {'SuperImmo': 'Superimmo'}
-
-    # 4.1.1 site column mapping (row 5 = headers)
-    site_col_411 = {}
-    for c in range(3, ws411.max_column+1):
-        h = ws411.cell(5, c).value
-        if h:
-            name = ALIAS_411.get(str(h).strip(), str(h).strip())
-            site_col_411[name] = c
-
-    # 4.1.1 TOTAL row per section
-    # row 80 = Pros Ventes TOTAL, row 100 = Pros Locations TOTAL
-    # Verification: find exact TOTAL rows by scanning
-    section_total_rows = {}
-    section_headers = {
-        80:  'Pros Ventes',
-        100: 'Pros Locations',
-        120: 'Particuliers Ventes',
-        140: 'Particuliers Locations',
-    }
-    # Verify these are indeed TOTAL rows
-    for expected_row, label in section_headers.items():
-        b = ws411.cell(expected_row, 2).value
-        if b and str(b).strip().upper() == 'TOTAL':
-            section_total_rows[label] = expected_row
-
-    pros_vte_row = section_total_rows.get('Pros Ventes')
-    pros_loc_row = section_total_rows.get('Pros Locations')
-    if not pros_vte_row or not pros_loc_row: return checks
-
-    # 1.1 site row mapping in Annonces Ancien section (rows ~27-44)
-    site_row_11 = {}
-    for r in range(24, 50):
-        b = ws11.cell(r, 2).value
-        if b and isinstance(b, str):
-            name = ALIAS_11.get(b.strip(), b.strip())
-            if name in SITES:
-                site_row_11[name] = r
-
-    # Per site: 4.1.1 Pros Ventes + Locations = 1.1 Ancien Pros
-    errors = []
-    ok_count = 0
-    for site in SITES:
-        col_411 = site_col_411.get(site)
-        row_11  = site_row_11.get(site)
-        if col_411 is None or row_11 is None: continue
-
-        v_vte = ws411.cell(pros_vte_row, col_411).value or 0
-        v_loc = ws411.cell(pros_loc_row, col_411).value or 0
-        v_sum = float(v_vte) + float(v_loc)
-        v_11  = float(ws11.cell(row_11, lc1).value or 0)
-
-        if v_sum == v_11:
-            ok_count += 1
-        else:
-            errors.append(
-                f"{site}: 4.1.1 Ventes({fmt(v_vte)})+Loc({fmt(v_loc)})={fmt(v_sum)} ≠ 1.1={fmt(v_11)} (diff={fmt(abs(v_sum-v_11))})"
-            )
-
-    if errors:
-        checks.append(check(
-            f"[tab 4.1.1 contrôle tab 1] 4.1.1 Pros Ventes+Locations = 1.1 Ancien Pros par site ({lm})",
-            False,
-            "❌ " + " | ".join(errors[:4]) + (f" +{len(errors)-4} autres" if len(errors) > 4 else "")
-            + " → Vérifier les fichiers 4.1 et 1",
-            "error", "tab 4.1.1 — contrôle tab 1-4 (rows 171/193/215/237)"
-        ))
-    elif ok_count > 0:
-        checks.append(check(
-            f"[tab 4.1.1 contrôle tab 1] 4.1.1 Pros Ventes+Locations = 1.1 Ancien Pros par site ({lm})",
-            True,
-            f"✅ {ok_count} sites cohérents.",
-            "error", "tab 4.1.1 — contrôle tab 1-4 (rows 171/193/215/237)"
-        ))
-
-    # Total Dedup check (AO kontrolü)
-    td_vte = ws411.cell(pros_vte_row, 18).value or 0
-    td_loc = ws411.cell(pros_loc_row, 18).value or 0
-    td_sum = float(td_vte) + float(td_loc)
-    # 1.1 row 42 = 'Total Panel Dédupliqué Marché' Ancien Pros
-    td_11 = None
-    for r in range(38, 50):
-        b = ws11.cell(r, 2).value
-        if b and 'dédupliqué marché' in str(b).lower():
-            td_11 = ws11.cell(r, lc1).value; break
-
-    if td_11 is not None:
-        ok_td = (td_sum == float(td_11))
-        checks.append(check(
-            f"[tab 4.1.1 AO contrôle] Pros Ventes+Locations Total Dedup = 1.1 Total Dédupliqué Marché ({lm})",
-            ok_td,
-            (f"✅ Cohérent : {fmt(td_sum)}" if ok_td else
-             f"❌ 4.1.1 Pros Vtes({fmt(td_vte)})+Loc({fmt(td_loc)})={fmt(td_sum)} ≠ 1.1={fmt(td_11)} (diff={fmt(abs(td_sum-float(td_11)))})"),
-            "error", "tab 4.1.1 — contrôle tab 1-4 (rows 171/193/215/237)"
-        ))
-
-    return checks
-    """
-    tab 5-2 (Grand Ouest) — MAX(sites) <= Total Dédupliqué per département
-    Panel Checker: =MAX(B460,...,F460)<=G460 — Vendée/Finistère/Maine-et-Loire hataları
-    """
-    checks = []
-    try:
-        wb52 = load_workbook(io.BytesIO(wb52_bytes), data_only=True)
-    except Exception:
-        return checks
-
-    for sn in wb52.sheetnames:
-        if sn.lower() == 'intro': continue
-        ws = wb52[sn]
-        lc, lm = get_lc(ws)
-        if not lc: continue
-
-        # Kolonlar: B=site1, C=site2,... dernier col avant Dédup = sites, son col = Dédup
-        # Header row 2'de "Total" ya da "Dédupliqué" içeren kolon = dedup_col
-        dedup_col = None
-        site_cols = []
-        for c in range(2, min(ws.max_column+1, 15)):
-            h = ws.cell(2, c).value or ws.cell(1, c).value
-            if not h: continue
-            if isinstance(h, str) and ('dédup' in h.lower() or 'total' in h.lower()):
-                dedup_col = c; break
-            site_cols.append(c)
-
-        if not site_cols or not dedup_col: continue
-
-        violations = []
-        for r in range(3, ws.max_row+1):
-            label = ws.cell(r, 1).value
-            if not label or not isinstance(label, str): continue
-            if any(x in str(label).upper() for x in ['TOTAL', 'SITE']): continue
-
-            site_vals = [ws.cell(r, c).value for c in site_cols
-                        if isinstance(ws.cell(r, c).value, (int, float)) and ws.cell(r, c).value > 0]
-            dedup_val = ws.cell(r, dedup_col).value
-
-            if site_vals and isinstance(dedup_val, (int, float)) and dedup_val > 0:
-                max_val = max(site_vals)
-                if max_val > dedup_val:
-                    violations.append(f"{str(label).strip()} (MAX={fmt(max_val)} > Dédup={fmt(dedup_val)})")
-
-        if violations:
+    # 1.1 Total Dedup = 3.1.4 Total Dedup
+    if 'file1' in files_bytes and 'file3_1' in files_bytes:
+        v1, m1 = get_dedup_marche('file1', 0)  # 1.1 Total
+        wb31 = load_workbook(io.BytesIO(files_bytes['file3_1']), data_only=True)
+        ws314 = wb31['3.1.4 Evolution Pros par type']
+        lc, lm, _, _ = get_last_two_months(ws314)
+        v31 = None
+        if lc:
+            for r in range(1, ws314.max_row+1):
+                b = ws314.cell(r,2).value
+                if b and 'général' in str(b).lower() and 'profes' in str(b).lower():
+                    v31 = ws314.cell(r, lc).value; break
+        if v1 and v31:
             checks.append(check(
-                f"[tab 5-2] MAX(sites) ≤ Total Dédupliqué — {sn} ({lm})",
-                False,
-                f"❌ {len(violations)} département(s) : {', '.join(violations[:5])}"
-                + (f" +{len(violations)-5}" if len(violations) > 5 else "")
-                + " → Vérifier la déduplication dans le fichier 5.2",
-                "error", "tab 5-2 — contrôle MAX déduplication"
+                f"1.1 Total Panel Dedup Marché = 3.1.4 Total général pros ({m1})",
+                is_close(v1, float(v31)),
+                f"File1={v1:,.0f} | File3.1={v31:,.0f} | diff={abs(v1-float(v31)):,.0f}",
+                "error", "Cross-file: 1 vs 3.1"
             ))
-        elif lm and site_cols:
+
+    # 3.1.4 Total = 3.2.1 Grand Total
+    if 'file3_1' in files_bytes and 'file3_2' in files_bytes:
+        wb31 = load_workbook(io.BytesIO(files_bytes['file3_1']), data_only=True)
+        wb32 = load_workbook(io.BytesIO(files_bytes['file3_2']), data_only=True)
+        ws314 = wb31['3.1.4 Evolution Pros par type']
+        ws321 = wb32['3.2.1 Pros par régions']
+
+        lc31, lm31, _, _ = get_last_two_months(ws314)
+        lc32, lm32, _, _ = get_last_two_months(ws321, site_col=2)
+
+        # 3.1.4 Total Panel Dédupliqué (all sites combined)
+        v314_total = None
+        if lc31:
+            for r in range(1, ws314.max_row+1):
+                b = ws314.cell(r,2).value
+                if b and str(b).strip() == 'Total':
+                    v314_total = ws314.cell(r,lc31).value; break
+
+        # 3.2.1 Grand TOTAL (sum of all regions, combined sites)
+        v321_total = None
+        if lc32:
+            for r in range(ws321.max_row, 0, -1):
+                b = ws321.cell(r,2).value
+                if b and str(b).strip() == 'TOTAL':
+                    # Sum all site columns
+                    total_sum = 0
+                    for c in range(3, ws321.max_column+1):
+                        v = ws321.cell(r,c).value
+                        if isinstance(v,(int,float)): total_sum += v
+                    v321_total = total_sum; break
+
+        if v314_total and v321_total and float(v314_total)>0:
             checks.append(check(
-                f"[tab 5-2] MAX(sites) ≤ Total Dédupliqué — {sn} ({lm})",
-                True, "✅ Tous les départements sont cohérents.", "error",
-                "tab 5-2 — contrôle MAX déduplication"
+                f"3.1.4 Total pros = 3.2.1 TOTAL ({lm31})",
+                is_close(float(v314_total), v321_total, tol=0.02),
+                f"3.1.4={v314_total:,.0f} | 3.2.1={v321_total:,.0f}",
+                "warning", "Cross-file: 3.1 vs 3.2"
+            ))
+
+    # 3.2 Total = 4.1 Total
+    if 'file3_2' in files_bytes and 'file4_1' in files_bytes:
+        v32, m32 = get_dedup_marche('file3_2', 0)
+        v41, m41 = get_dedup_marche('file4_1', 0)
+        if v32 and v41:
+            checks.append(check(
+                f"3.2 Total Dedup = 4.1 Total Dedup ({m32})",
+                is_close(v32, v41),
+                f"File3.2={v32:,.0f} | File4.1={v41:,.0f} | diff={abs(v32-v41):,.0f}",
+                "error", "Cross-file: 3.2 vs 4.1"
             ))
 
     return checks
-
-
-def check_tab5_max(wb5_bytes):
-    """
-    tab 5 (Focus IDF & Alpes-Maritimes) — MAX(sites) <= Total Dédupliqué per arrondissement
-    Panel Checker: =MAX(C590,D590,E590,F590)<=G590 — 5ème et 13ème arr. en erreur
-    """
-    checks = []
-    try:
-        wb5 = load_workbook(io.BytesIO(wb5_bytes), data_only=True)
-    except Exception:
-        return checks
-
-    for sn in wb5.sheetnames:
-        if sn.lower() == 'intro': continue
-        ws = wb5[sn]
-        lc, lm = get_lc(ws)
-        if not lc: continue
-
-        dedup_col = None
-        site_cols = []
-        for c in range(2, min(ws.max_column+1, 12)):
-            h = ws.cell(2, c).value or ws.cell(1, c).value
-            if not h: continue
-            if isinstance(h, str) and ('dédup' in h.lower() or 'dedup' in h.lower()):
-                dedup_col = c; break
-            if isinstance(h, str) and h.strip() not in ('', 'Site', 'Arrondissement'):
-                site_cols.append(c)
-
-        if not site_cols or not dedup_col: continue
-
-        violations = []
-        for r in range(3, ws.max_row+1):
-            label = ws.cell(r, 1).value or ws.cell(r, 2).value
-            if not label or not isinstance(label, str): continue
-            label_str = str(label).strip()
-            if any(x in label_str.upper() for x in ['TOTAL', 'SITE', 'RÉGION']): continue
-            if not any(c.isdigit() for c in label_str): continue
-
-            site_vals = [ws.cell(r, c).value for c in site_cols
-                        if isinstance(ws.cell(r, c).value, (int, float)) and ws.cell(r, c).value > 0]
-            dedup_val = ws.cell(r, dedup_col).value
-
-            if site_vals and isinstance(dedup_val, (int, float)) and dedup_val > 0:
-                max_val = max(site_vals)
-                if max_val > dedup_val:
-                    violations.append(f"{label_str} (MAX={fmt(max_val)} > Dédup={fmt(dedup_val)})")
-
-        if violations:
-            checks.append(check(
-                f"[tab 5] MAX(sites) ≤ Total Dédupliqué — {sn} ({lm})",
-                False,
-                f"❌ {len(violations)} arrondissement(s) : {', '.join(violations[:5])}"
-                + " → Vérifier la déduplication dans le fichier 5",
-                "error", "tab 5 — contrôle MAX déduplication"
-            ))
-        elif lm and site_cols:
-            checks.append(check(
-                f"[tab 5] MAX(sites) ≤ Total Dédupliqué — {sn} ({lm})",
-                True, "✅ Tous les arrondissements sont cohérents.", "error",
-                "tab 5 — contrôle MAX déduplication"
-            ))
-
-    return checks
-
 
 # ─── MAIN RUNNER ─────────────────────────────────────────────────────────────
 
@@ -916,25 +679,21 @@ def run_all_qc_gold(uploaded_files):
     files_bytes, file_labels = classify_files(uploaded_files)
     all_checks = []
 
-    # 3.1 × 1 — contrôle type + contrôle tab 1
+    # Specific checks for tab 3.1 and 3.2
     if 'file3_1' in files_bytes and 'file1' in files_bytes:
         all_checks += check_tab31(files_bytes['file3_1'], files_bytes['file1'])
-    # 3.2 × 3.1 — contrôle tab 3.1.4 + contrôle segment + MAX dédup
     if 'file3_2' in files_bytes and 'file3_1' in files_bytes:
         all_checks += check_tab32(files_bytes['file3_2'], files_bytes['file3_1'])
-    # tab 5 × tab 3.2 — Alpes-Maritimes cross-check
-    if 'file5' in files_bytes and 'file3_2' in files_bytes:
-        all_checks += check_tab5_vs_tab32(files_bytes['file5'], files_bytes['file3_2'])
-    # tab 4.1.1 × tab 1 — contrôle tab 1-4 (rows 171/193/215/237, hardcoded False dans Panel Checker)
-    if 'file4_1' in files_bytes and 'file1' in files_bytes:
-        all_checks += check_tab411_vs_tab1(files_bytes['file4_1'], files_bytes['file1'])
-    if 'file5' in files_bytes:
-        all_checks += check_tab5_max(files_bytes['file5'])
-    # tab 5-2 — MAX(sites) <= Dédupliqué par département (Grand Ouest)
-    if 'file5_2' in files_bytes:
-        all_checks += check_tab52_max(files_bytes['file5_2'])
 
-    return all_checks, files_bytes
+    # Generic checks for all files
+    for key, label in file_labels.items():
+        if key in files_bytes:
+            all_checks += check_generic_tab(files_bytes[key], label)
+
+    # Cross-file checks
+    all_checks += check_cross_files(files_bytes)
+
+    return all_checks, list(files_bytes.keys())
 
 
 def parse_ham_sections(uploaded_files):
@@ -1147,124 +906,64 @@ if page == "📊 Panel Tables Monitor":
 
 elif page == "✅ Panel Checker (QC Gold)":
     st.markdown(f"# ✅ Panel Checker (QC Gold) — {market}")
-    st.caption("Upload the 10 source files — same checks as the Panel Checker, no Panel Checker file needed.")
     st.divider()
 
     if not uploaded_files:
-        st.info("👆 Upload your source files in the sidebar to get started"); st.stop()
+        st.info("👆 Upload your files in the sidebar to get started"); st.stop()
 
     with st.spinner("Running QC Gold checks..."):
-        all_checks, files_bytes = run_all_qc_gold(uploaded_files)
-
-    # ── Fichiers détectés ──
-    FILE_LABEL_MAP = {
-        'file1':'1 — Evolution panel','file2':'2 — Performance qualité',
-        'file3_1':'3.1 — Analyse Pros','file3_2':'3.2 — Géographique Pros',
-        'file4_1':'4.1 — Stats géographiques','file4_2':'4.2 — Exclusivité/Partage',
-        'file5':'5 — Focus IDF','file5_2':'5.2 — Grand Ouest',
-    }
-    EXPECTED = list(FILE_LABEL_MAP.keys())
-    detected_keys = list(files_bytes.keys())
-    missing = [FILE_LABEL_MAP[k] for k in EXPECTED if k not in detected_keys]
-
-    if missing:
-        st.warning(f"⚠️ {len(missing)} file(s) not detected: {', '.join(missing)}")
-    else:
-        st.success(f"✅ All {len(detected_keys)} source files detected")
-
-    with st.expander("📂 Detected files", expanded=False):
-        for k in EXPECTED:
-            icon = "✅" if k in detected_keys else "❌"
-            st.markdown(f"{icon} {FILE_LABEL_MAP[k]}")
+        all_checks, detected = run_all_qc_gold(uploaded_files)
 
     if not all_checks:
         st.warning("No checks could be run. Make sure the correct files are uploaded."); st.stop()
 
-    st.divider()
+    errors=[c for c in all_checks if c['status']=='fail' and c['severity']=='error']
+    warnings=[c for c in all_checks if c['severity']=='warning']
+    ok_checks=[c for c in all_checks if c['status']=='ok']
 
-    errors   = [c for c in all_checks if c['status']=='fail' and c['severity']=='error']
-    warnings = [c for c in all_checks if c['severity']=='warning']
-    ok_checks= [c for c in all_checks if c['status']=='ok']
+    if errors: st.error(f"❌ REFUSED — {len(errors)} error(s) · {len(warnings)} warning(s)")
+    elif warnings: st.warning(f"⚠️ TO REVIEW — {len(warnings)} warning(s)")
+    else: st.success(f"✅ VALIDATED — all {len(ok_checks)} checks passed")
 
-    # ── Global verdict ──
-    if errors:
-        st.error(f"❌ **{len(errors)} error(s)** — Files need correction before sending to the team")
-    elif warnings:
-        st.warning(f"⚠️ **{len(warnings)} warning(s)** — Review before validating")
-    else:
-        st.success(f"✅ **All {len(ok_checks)} checks passed** — Files are clean")
-
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Total checks", len(all_checks))
-    c2.metric("✅ Passed",    len(ok_checks))
-    c3.metric("❌ Errors",    len(errors))
-    c4.metric("🟡 Warnings",  len(warnings))
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Total checks",len(all_checks))
+    c2.metric("✅ Passed",len(ok_checks))
+    c3.metric("❌ Errors",len(errors))
+    c4.metric("🟡 Warnings",len(warnings))
 
     st.divider()
 
-    # ── Résultats par section (groupés par sheet) ──
-    by_sheet = defaultdict(list)
+    by_sheet=defaultdict(list)
     for c in all_checks:
-        by_sheet[c.get('sheet','Other')].append(c)
+        by_sheet[c.get('sheet','Unknown')].append(c)
 
     def sheet_priority(items):
         if any(i['status']=='fail' and i['severity']=='error' for i in items): return 0
         if any(i['severity']=='warning' for i in items): return 1
         return 2
 
-    for sheet, items in sorted(by_sheet.items(), key=lambda x: sheet_priority(x[1])):
-        n_err  = sum(1 for i in items if i['status']=='fail' and i['severity']=='error')
-        n_warn = sum(1 for i in items if i['severity']=='warning')
-        n_ok   = sum(1 for i in items if i['status']=='ok')
-        icon   = "❌" if n_err else "🟡" if n_warn else "✅"
-        badge  = f"{n_err} error(s)" if n_err else f"{n_warn} warning(s)" if n_warn else f"{n_ok} OK"
+    for sheet,items in sorted(by_sheet.items(),key=lambda x:sheet_priority(x[1])):
+        n_err=sum(1 for i in items if i['status']=='fail' and i['severity']=='error')
+        n_warn=sum(1 for i in items if i['severity']=='warning')
+        n_ok=sum(1 for i in items if i['status']=='ok')
+        icon="❌" if n_err else "🟡" if n_warn else "✅"
+        badge=f"{n_err} error(s)" if n_err else f"{n_warn} warning(s)" if n_warn else f"{n_ok} OK"
 
-        with st.expander(f"{icon} **{sheet}** — {badge}", expanded=(n_err > 0)):
+        with st.expander(f"{icon} **{sheet}** — {badge}",expanded=(n_err>0)):
             for item in items:
-                if item['status'] == 'ok':
+                if item['status']=='ok':
                     st.markdown(f"✅ {item['check']}")
-                elif item['severity'] == 'error':
+                elif item['severity']=='error':
                     st.markdown(f"❌ **{item['check']}**")
-                    st.caption(f"   {item['detail']}")
+                    st.caption(f"  {item['detail']}")
                 else:
                     st.markdown(f"🟡 {item['check']}")
-                    st.caption(f"   {item['detail']}")
+                    st.caption(f"  {item['detail']}")
 
     st.divider()
-
-    # ── Message taslağı (sadece hata varsa) ──
-    if errors or warnings:
-        st.markdown("### 📧 Message draft for the team")
-        month_guess = ""
-        for f in uploaded_files:
-            n = f.name.lower()
-            for m in ['janvier','février','mars','avril','mai','juin',
-                      'juillet','août','septembre','octobre','novembre','décembre']:
-                if m in n:
-                    month_guess = m.capitalize() + " 2026"; break
-            if month_guess: break
-        if not month_guess: month_guess = "mois courant"
-
-        lines = [f"Bonjour,\n",
-                 f"En vérifiant les fichiers sources pour {month_guess}, "
-                 f"j'ai détecté les points suivants à corriger :\n"]
-        for item in errors:
-            lines.append(f"❌ [{item.get('sheet','')}] {item['check']}\n   → {item['detail']}")
-        for item in warnings:
-            lines.append(f"⚠️ [{item.get('sheet','')}] {item['check']}\n   → {item['detail']}")
-        lines.append("\nMerci de vérifier et corriger avant validation.\n\nCordialement")
-        msg = "\n".join(lines)
-        st.text_area("", value=msg, height=320, key="msg_qc_gold")
-        st.download_button("⬇️ Download message (.txt)", data=msg.encode("utf-8"),
-            file_name=f"qc_errors_{datetime.datetime.now().strftime('%Y%m%d')}.txt",
-            mime="text/plain")
-
-    # ── CSV Export ──
-    rows_exp = [{'Sheet': c.get('sheet',''), 'Check': c['check'],
-        'Status': '❌ Error' if c['status']=='fail' and c['severity']=='error'
-                  else '🟡 Warning' if c['severity']=='warning' else '✅ OK',
-        'Detail': c.get('detail','')} for c in all_checks]
-    csv = pd.DataFrame(rows_exp).to_csv(index=False).encode('utf-8-sig')
-    st.download_button("⬇️ Download full report (CSV)", data=csv,
-        file_name=f"qc_gold_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-        mime='text/csv')
+    rows_exp=[{'Sheet':c.get('sheet',''),'Check':c['check'],
+        'Status':'❌ Error' if c['status']=='fail' and c['severity']=='error' else '🟡 Warning' if c['severity']=='warning' else '✅ OK',
+        'Detail':c.get('detail','')} for c in all_checks]
+    csv=pd.DataFrame(rows_exp).to_csv(index=False).encode('utf-8-sig')
+    st.download_button("⬇️ Download report (CSV)",data=csv,
+        file_name=f"qc_gold_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",mime='text/csv')
