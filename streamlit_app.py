@@ -6,7 +6,7 @@ from openpyxl import load_workbook
 from collections import defaultdict
 import datetime, io, hashlib
 
-APP_VERSION = "4.0.1"
+APP_VERSION = "5.0.0"
 
 st.set_page_config(page_title="IMMO FR · Panel QC", page_icon="🏠", layout="wide")
 
@@ -180,8 +180,8 @@ def panel_dedup_by_index(wbs):
 def z_checks(d, group, z_min=3.5, vol_min=200, skip_inactive_sites=True):
     """
     Z-score vs trailing history. Avg = mean of positive values over the
-    up-to-12 months before the reference month (not the full series blindly).
-    Skips known sites with no volume in the reference month.
+    up-to-12 months before the reference month. Skips sites with no
+    volume in the reference month (inactive).
     """
     out = []
     lm = d.get("_lm", "?")
@@ -235,11 +235,7 @@ def _is_num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 def read_go_y1_sections(ws):
-    """
-    Read the Grand Ouest Y-1 wide-format sheets.
-    These sheets use Département in column A and site/dedup metrics as columns,
-    unlike the monthly time-series sheets read by read_series().
-    """
+    """Read Grand Ouest Y-1 wide-format sheets (Département in col A, metrics as columns)."""
     hdrs=[r for r in range(1,ws.max_row+1) if ws.cell(r,1).value=="Département"]
     sections=[]
     for i,hdr in enumerate(hdrs):
@@ -259,40 +255,30 @@ def read_go_y1_sections(ws):
         for r in range(hdr+1,stop+1):
             dept=ws.cell(r,1).value
             if not dept or not isinstance(dept,str) or not dept.strip():
-                if started:
-                    break
+                if started: break
                 continue
-            dept=dept.strip()
-            started=True
+            dept=dept.strip(); started=True
             sec[dept]={h:ws.cell(r,c).value for h,c in headers}
         sections.append(sec)
     return sections
 
 def _go_y1_metric(vals, metric_name):
-    """Get an exact metric from a row dict, tolerant to accents/spaces."""
     target=norm(metric_name)
     for k,v in vals.items():
-        if norm(k)==target:
-            return v
+        if norm(k)==target: return v
     return None
 
 def _go_y1_site_metrics(headers):
     return [h for h in headers if "dedup" not in norm(h) and "marche" not in norm(h)]
 
 def grand_ouest_y1_checks(ws, sheet_name, group="5.2 Y-1"):
-    """
-    Main integrity checks for 5.2 Grand Ouest Y-1 files.
-    Kept separate from the existing generic monthly logic because these sheets
-    are wide snapshot tables, not month-series tables.
-    """
+    """Integrity checks for 5.2 Grand Ouest Y-1 wide snapshot tables."""
     checks=[]
     sections=read_go_y1_sections(ws)
     if not sections:
         checks.append(chk(f"{sheet_name} — Y-1 sections detected", False,
                           "No Département sections found in column A", group))
         return checks
-
-    # Expected: section 0=Total, section 1=Vente, section 2=Location, section 3=announcer/pro count.
     if len(sections)>=3:
         total,vente,loc=sections[0],sections[1],sections[2]
         depts_total={k for k in total if isinstance(k,str) and not k.startswith("_")}
@@ -306,7 +292,6 @@ def grand_ouest_y1_checks(ws, sheet_name, group="5.2 Y-1"):
             if structure_ok else
             f"Dept counts: total={len(depts_total)}, vente={len(depts_vente)}, loc={len(depts_loc)} · common metrics={len(common_metrics)}",
             group))
-
         mismatches=[]; compared=0
         for dept in sorted(common_depts):
             for metric in sorted(common_metrics):
@@ -314,22 +299,18 @@ def grand_ouest_y1_checks(ws, sheet_name, group="5.2 Y-1"):
                 if _is_num(t) and _is_num(v) and _is_num(l) and abs(float(t))>0:
                     compared+=1
                     if not close(float(v)+float(l),float(t),1.0):
-                        mismatches.append(
-                            f"{dept} × {metric}: Vente {fmt(v)} + Loc {fmt(l)} = {fmt(float(v)+float(l))}, Total {fmt(t)}")
+                        mismatches.append(f"{dept} × {metric}: V {fmt(v)} + L {fmt(l)} = {fmt(float(v)+float(l))}, Total {fmt(t)}")
         checks.append(chk(f"{sheet_name} — Y-1 Vente+Location = Total",
             len(mismatches)==0 and compared>0,
             f"{compared}/{compared} comparisons matched" if not mismatches and compared>0
             else f"{len(mismatches)} mismatch(es) over {compared} comparisons: {'; '.join(mismatches[:3])}",
             group))
-
-    hierarchy_viol=[]; hierarchy_compared=0
-    site_viol=[]; site_compared=0
+    hierarchy_viol=[]; hierarchy_compared=0; site_viol=[]; site_compared=0
     for sec in sections:
         label=sec.get("_label") or f"section row {sec.get('_hdr','?')}"
         site_headers=_go_y1_site_metrics(sec.get("_headers",[]))
         for dept,vals in sec.items():
-            if not isinstance(dept,str) or dept.startswith("_"):
-                continue
+            if not isinstance(dept,str) or dept.startswith("_"): continue
             dedup=_go_y1_metric(vals,"Marché dédup")
             top11=_go_y1_metric(vals,"Marché dédup Top 11")
             top5=_go_y1_metric(vals,"Marché dédup Top 5")
@@ -348,19 +329,16 @@ def grand_ouest_y1_checks(ws, sheet_name, group="5.2 Y-1"):
                         site_compared+=1
                         if float(sv_)>float(dedup)*1.01:
                             site_viol.append(f"{label} · {dept} × {site}: {fmt(sv_)} > Dédup {fmt(dedup)}")
-
     checks.append(chk(f"{sheet_name} — Y-1 dedup hierarchy",
         len(hierarchy_viol)==0 and hierarchy_compared>0,
         f"{hierarchy_compared}/{hierarchy_compared} hierarchy comparisons matched" if not hierarchy_viol and hierarchy_compared>0
-        else f"{len(hierarchy_viol)} violation(s) over {hierarchy_compared} comparisons: {'; '.join(hierarchy_viol[:3])}",
+        else f"{len(hierarchy_viol)} violation(s) over {hierarchy_compared}: {'; '.join(hierarchy_viol[:3])}",
         group))
-
     checks.append(chk(f"{sheet_name} — Y-1 no site exceeds Marché dédup",
         len(site_viol)==0 and site_compared>0,
         f"{site_compared}/{site_compared} site≤dedup comparisons matched" if not site_viol and site_compared>0
-        else f"{len(site_viol)} violation(s) over {site_compared} comparisons: {'; '.join(site_viol[:3])}",
+        else f"{len(site_viol)} violation(s) over {site_compared}: {'; '.join(site_viol[:3])}",
         group))
-
     return checks
 
 # ═══════════════════════════════════════════════
@@ -477,11 +455,11 @@ def run_checks(fb, wbs):
                         lm2==lm1,
                         f"File 2: {lm2} · File 1: {lm1}","2"))
 
-        # Z-score on all sections of each sheet
+        # Z-score on all sheets
         for sn in w2.sheetnames:
             if sn=="Intro" or "DPE" in sn: continue
-            for d in read_all_sections(w2[sn]):
-                if d: C.extend(z_checks(d,"2"))
+            d=read_series(w2[sn],section=0)
+            if d: C.extend(z_checks(d,"2"))
 
     # ── FILE 3.1 ────────────────────────────────────────────────
     if "file3_1" in wbs and "file1" in wbs:
@@ -989,31 +967,25 @@ def run_checks(fb, wbs):
                 C.append(chk("5.1 IDF: no site exceeds dedup per department",viol==0,
                     f"{viol} IDF dept(s) with site > dedup" if viol else "All IDF depts OK","5"))
 
-    # ── FILE 5.2 Y-1 — Grand Ouest previous-year snapshot ───────
+        # ── FILE 5.2 Y-1 — Grand Ouest previous-year snapshot ───────
     if "file5_2_y1" in wbs:
         w52y1=wbs["file5_2_y1"]
         for sn in w52y1.sheetnames:
-            if sn=="Intro":
-                continue
+            if sn=="Intro": continue
             C.extend(grand_ouest_y1_checks(w52y1[sn], sn, "5.2 Y-1"))
 
-    # ── FILES 5 / 5.2 / 6 ────────────────────────────────────────
-    for key, grp in [("file5", "5"), ("file5_2", "5.2"), ("file6", "6")]:
-        if key not in wbs:
-            continue
+    # ── FILES 5 / 5.2 / 6 ────────────────────────────────────
+    for key,grp in [("file5","5"),("file5_2","5.2"),("file6","6")]:
+        if key not in wbs: continue
         for sn in wbs[key].sheetnames:
-            if sn == "Intro":
-                continue
-            for d in read_all_sections(wbs[key][sn]):
-                if not d:
-                    continue
-                total = sv(d, "Total")
-                dedup = sv(d, "Total Panel Dédupliqué")
-                if total and dedup and total > 100:
-                    C.append(chk(
-                        f"Dedup ≤ total — {sn}", dedup <= total * 1.01,
-                        f"Dedup: {fmt(dedup)} · Total: {fmt(total)}", grp))
-                C.extend(z_checks(d, grp, z_min=4.0, vol_min=500))
+            if sn=="Intro": continue
+            d=read_series(wbs[key][sn],section=0)
+            if not d: continue
+            lm=d["_lm"]; total=sv(d,"Total"); dedup=sv(d,"Total Panel Dédupliqué")
+            if total and dedup and total>100:
+                C.append(chk(f"Dedup ≤ total — {sn}",dedup<=total*1.01,
+                    f"Dedup: {fmt(dedup)} · Total: {fmt(total)}",grp))
+            C.extend(z_checks(d,grp,z_min=4.0,vol_min=500))
 
     return C
 
@@ -1053,25 +1025,20 @@ def _trend_row(fname, sn, label, site, mo, lm, pm, sd, dd):
     flags, status = [], "ok"
     if evol is not None:
         if evol <= -20:
-            status = "alert"
-            flags.append(f"Drop {evol:.1f}% vs {actual_pm}")
+            status = "alert"; flags.append(f"Drop {evol:.1f}% vs {actual_pm}")
         elif evol <= -10:
-            status = "warn"
-            flags.append(f"Decline {evol:.1f}% vs {actual_pm}")
+            status = "warn"; flags.append(f"Decline {evol:.1f}% vs {actual_pm}")
         elif evol >= 30:
-            status = "warn"
-            flags.append(f"Surge +{evol:.1f}% vs {actual_pm}")
+            status = "warn"; flags.append(f"Surge +{evol:.1f}% vs {actual_pm}")
     hist_peak = [v for v in raw_vals[max(0, n - 13):-1] if v and v > 0]
     if hist_peak and lv / max(hist_peak) < 0.6:
-        status = "alert"
-        flags.append(f"Crash {(lv / max(hist_peak) - 1) * 100:.1f}% vs 12m peak")
+        status = "alert"; flags.append(f"Crash {(lv / max(hist_peak) - 1) * 100:.1f}% vs 12m peak")
     if n >= 3:
         l3 = raw_vals[n - 3:n]
         if all(v and v > 0 for v in l3) and l3[0] > l3[1] > l3[2]:
             drop = (l3[2] - l3[0]) / l3[0] * 100
             if drop < -5:
-                if status == "ok":
-                    status = "warn"
+                if status == "ok": status = "warn"
                 flags.append(f"3-month downtrend {drop:.1f}%")
     evol_y1 = None
     if li >= 12:
@@ -1081,8 +1048,7 @@ def _trend_row(fname, sn, label, site, mo, lm, pm, sd, dd):
         if y1v and isinstance(y1v, (int, float)) and y1v > 5:
             evol_y1 = (lv / y1v - 1) * 100
             if abs(evol_y1) > 30:
-                if status == "ok":
-                    status = "warn"
+                if status == "ok": status = "warn"
                 flags.append(f"M/Y-1: {evol_y1:+.1f}% vs {y1_label}")
     spark_vals = strip_trailing_zeros(raw_vals)
     return {
@@ -1127,6 +1093,194 @@ def build_trends(raw_bytes_dict, wbs=None):
     return rows
 
 # ═══════════════════════════════════════════════
+# SPECIAL CHECK — MARKET SHARE ANALYSIS (MoM)
+# ═══════════════════════════════════════════════
+
+def market_share_analysis(wbs):
+    """
+    Market share = site listings / total deduplicated listings (per segment).
+    Tracked Month-over-Month (reference month vs previous month, in pp).
+
+    Two breakdowns:
+      A) Sales (Vente) vs Rentals (Location) × Pros vs Private (Particuliers)
+         from 1.3 Loc_Ventes (6 sections)
+      B) Pro by type (Agences / Intermédiaires / Notaires / Autres)
+         from 1.4 Type de professionels
+
+    Important UI rule: inactive sites are excluded from Special Check tables.
+    This avoids rows like AvendreAlouer with no real activity showing empty / 0 values.
+    """
+    out = {
+        "vente_location": [],
+        "by_type": [],
+        "lm": "—",
+        "pm": "—",
+        "dedup_vl": {},
+        "dedup_type": {},
+        "inactive_vl": defaultdict(list),
+        "inactive_type": defaultdict(list),
+    }
+    if "file1" not in wbs:
+        return out
+    w1 = wbs["file1"]
+
+    def _site_series(d, site):
+        return d.get(site) or next(
+            (d[k] for k in d if isinstance(k, str)
+             and site.lower() in k.lower()
+             and not k.startswith("_")),
+            None
+        )
+
+    def _pct_change(now, prev):
+        if prev is None or not isinstance(prev, (int, float)) or prev <= 0:
+            return None
+        if now is None or not isinstance(now, (int, float)):
+            return None
+        return (now / prev - 1) * 100
+
+    def _status(ms_now, delta_pp, listings_mom):
+        """One status used for row colors in the Special Check UI."""
+        if ms_now is not None and ms_now > 100.5:
+            return "alert", "Share exceeds 100%"
+        if delta_pp is not None and abs(delta_pp) >= 5:
+            return "alert", "Large market-share shift"
+        if listings_mom is not None and (listings_mom <= -25 or listings_mom >= 40):
+            return "alert", "Large listing-volume shift"
+        if delta_pp is not None and abs(delta_pp) >= 3:
+            return "warn", "Moderate market-share shift"
+        if listings_mom is not None and (listings_mom <= -15 or listings_mom >= 25):
+            return "warn", "Moderate listing-volume shift"
+        return "ok", "Stable"
+
+    # ── A) Vente/Location × Pros/Particuliers (1.3 Loc_Ventes) ──
+    ws13 = ws_get(w1, "1.3 Loc_Ventes")
+    if ws13:
+        # 6 sections: 0=Ventes, 1=Ventes Pros, 2=Ventes Part,
+        #             3=Locations, 4=Locations Pros, 5=Locations Part
+        seg_labels = {
+            0: ("Sales", "All"),
+            1: ("Sales", "Pros"),
+            2: ("Sales", "Private"),
+            3: ("Rentals", "All"),
+            4: ("Rentals", "Pros"),
+            5: ("Rentals", "Private"),
+        }
+        for sec, (transaction, segment) in seg_labels.items():
+            d = read_series(ws13, section=sec)
+            if not d:
+                continue
+            out["lm"] = d.get("_lm", "—")
+            out["pm"] = d.get("_pm", "—")
+            dd = d.get("Total Panel Dédupliqué Marché") or d.get("Total Panel Dédupliqué")
+            if not dd:
+                continue
+            dd_last, dd_prev = dd["last"], dd["prev"]
+            if dd_last is None or not isinstance(dd_last, (int, float)) or dd_last <= 0:
+                continue
+            seg_key = f"{transaction} · {segment}"
+            out["dedup_vl"][seg_key] = {
+                "now": dd_last,
+                "prev": dd_prev,
+                "mom": _pct_change(dd_last, dd_prev),
+            }
+
+            for ent in SITES:
+                sd = _site_series(d, ent)
+                if not sd:
+                    continue
+                if not site_active(sd, min_vol=50):
+                    out["inactive_vl"][seg_key].append(ent)
+                    continue
+                listings_now, listings_prev = sd["last"], sd["prev"]
+                ms_now = (listings_now / dd_last * 100) if listings_now is not None else None
+                ms_prev = (listings_prev / dd_prev * 100) if dd_prev and listings_prev is not None else None
+                if ms_now is None:
+                    continue
+                delta = (ms_now - ms_prev) if ms_prev is not None else None
+                listings_mom = _pct_change(listings_now, listings_prev)
+                status, reason = _status(ms_now, delta, listings_mom)
+                out["vente_location"].append({
+                    "breakdown": "Transaction×Segment",
+                    "transaction": transaction,
+                    "segment": segment,
+                    "entity": ent,
+                    "listings": listings_now,
+                    "listings_prev": listings_prev,
+                    "listings_mom": listings_mom,
+                    "dedup": dd_last,
+                    "dedup_prev": dd_prev,
+                    "dedup_mom": _pct_change(dd_last, dd_prev),
+                    "ms_now": ms_now,
+                    "ms_prev": ms_prev,
+                    "delta": delta,
+                    "status": status,
+                    "reason": reason,
+                })
+
+    # ── B) Pro by type (1.4 Type de professionels) ──
+    ws14 = ws_get(w1, "1.4 Type de professionels")
+    if ws14:
+        # 12 sections, grouped by type: [Total, Vente, Location] × [Agences, Interméd, Notaires, Autres]
+        # We use the "Total" section of each type (sections 0,3,6,9)
+        type_sections = {0: "Agences", 3: "Intermédiaires", 6: "Notaires", 9: "Autres"}
+        for sec, type_name in type_sections.items():
+            d = read_series(ws14, section=sec)
+            if not d:
+                continue
+            out["lm"] = d.get("_lm", out.get("lm", "—"))
+            out["pm"] = d.get("_pm", out.get("pm", "—"))
+            dd = d.get("Total Panel Dédupliqué Marché") or d.get("Total Panel Dédupliqué")
+            if not dd:
+                continue
+            dd_last, dd_prev = dd["last"], dd["prev"]
+            if dd_last is None or not isinstance(dd_last, (int, float)) or dd_last <= 0:
+                continue
+            out["dedup_type"][type_name] = {
+                "now": dd_last,
+                "prev": dd_prev,
+                "mom": _pct_change(dd_last, dd_prev),
+            }
+
+            for ent in SITES:
+                sd = _site_series(d, ent)
+                if not sd:
+                    continue
+                if not site_active(sd, min_vol=50):
+                    out["inactive_type"][type_name].append(ent)
+                    continue
+                listings_now, listings_prev = sd["last"], sd["prev"]
+                ms_now = (listings_now / dd_last * 100) if listings_now is not None else None
+                ms_prev = (listings_prev / dd_prev * 100) if dd_prev and listings_prev is not None else None
+                if ms_now is None:
+                    continue
+                delta = (ms_now - ms_prev) if ms_prev is not None else None
+                listings_mom = _pct_change(listings_now, listings_prev)
+                status, reason = _status(ms_now, delta, listings_mom)
+                out["by_type"].append({
+                    "breakdown": "Pro type",
+                    "type": type_name,
+                    "entity": ent,
+                    "listings": listings_now,
+                    "listings_prev": listings_prev,
+                    "listings_mom": listings_mom,
+                    "dedup": dd_last,
+                    "dedup_prev": dd_prev,
+                    "dedup_mom": _pct_change(dd_last, dd_prev),
+                    "ms_now": ms_now,
+                    "ms_prev": ms_prev,
+                    "delta": delta,
+                    "status": status,
+                    "reason": reason,
+                })
+
+    # Convert defaultdicts to normal dicts so Streamlit cache serialization stays predictable.
+    out["inactive_vl"] = dict(out["inactive_vl"])
+    out["inactive_type"] = dict(out["inactive_type"])
+    return out
+
+
+# ═══════════════════════════════════════════════
 # CACHED COMPUTE
 # ═══════════════════════════════════════════════
 
@@ -1137,9 +1291,10 @@ def compute_everything(file_hash, raw_bytes_dict):
     for role,data in fb.items():
         try: wbs[role]=load_workbook(io.BytesIO(data),data_only=True)
         except: pass
-    checks = run_checks(fb, wbs)
-    trends = build_trends(raw_bytes_dict, wbs)
-    return checks, trends, fb
+    checks=run_checks(fb,wbs)
+    trends=build_trends(raw_bytes_dict,wbs)
+    mshare=market_share_analysis(wbs)
+    return checks,trends,fb,mshare
 
 # ═══════════════════════════════════════════════
 # SIDEBAR
@@ -1177,7 +1332,7 @@ if not uploaded:
 # COMPUTE
 # ═══════════════════════════════════════════════
 
-checks,trends,fb=compute_everything(file_hash,raw_bytes)
+checks,trends,fb,mshare=compute_everything(file_hash,raw_bytes)
 n_err =sum(1 for c in checks if not c["ok"] and c["sev"]=="error")
 n_warn=sum(1 for c in checks if c["sev"]=="warning")
 n_ok  =sum(1 for c in checks if c["ok"])
@@ -1212,7 +1367,7 @@ site_filter=chosen if chosen else None
 # TABS
 # ═══════════════════════════════════════════════
 
-tab1,tab2,tab3=st.tabs(["📋  Overview","📈  Monthly trends","🔍  Data integrity"])
+tab1,tab_ms,tab2,tab3=st.tabs(["📋  Overview","🎯  Special check","📈  Monthly trends","🔍  Data integrity"])
 
 # ═════════════ OVERVIEW ════════════
 
@@ -1282,26 +1437,301 @@ with tab1:
     else:
         st.success("No blocking errors — all cross-file consistency checks passed.")
 
+# ═════════════ SPECIAL CHECK — MARKET SHARE ══════════════
+
+with tab_ms:
+    st.markdown("""
+    <style>
+    .ms-help-box {
+        border: 1px solid rgba(120,120,120,.25);
+        border-radius: 14px;
+        padding: 14px 16px;
+        background: rgba(120,120,120,.06);
+        margin-bottom: 12px;
+    }
+    .ms-help-box b {font-size: 1.02rem;}
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("### 🎯 Special check — market share & dedup MoM")
+    st.markdown(
+        f"""
+        <div class="ms-help-box">
+          <b>What this checks</b><br>
+          For each active website, the app compares <b>{mshare.get('lm','—')}</b> vs <b>{mshare.get('pm','—')}</b>:
+          listing volume, listing MoM %, market share %, and market-share movement in percentage points.<br>
+          The deduplicated market is still the denominator, but now each website has its own MoM comparison against it.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    vl_rows = mshare.get("vente_location", [])
+    bt_rows = mshare.get("by_type", [])
+
+    if not vl_rows and not bt_rows:
+        st.info("Market share analysis requires File 1 (1.3 Loc_Ventes and 1.4 Type de professionels).")
+    else:
+        def _ent_match(ent):
+            if not site_filter:
+                return True
+            return any(s.lower() in ent.lower() for s in site_filter)
+
+        def _status_icon(status):
+            return "🔴 Alert" if status == "alert" else "🟡 Review" if status == "warn" else "✅ OK"
+
+        def _fmt_pct(v):
+            return f"{v:+.1f}%" if v is not None else "—"
+
+        def _fmt_share(v):
+            return f"{v:.1f}%" if v is not None else "—"
+
+        def _fmt_pp(v):
+            return f"{v:+.1f}pp" if v is not None else "—"
+
+        def _style_ms_table(df):
+            def _row_style(row):
+                status = str(row.get("Status", ""))
+                if "🔴" in status:
+                    bg = "background-color: #fdecec"
+                elif "🟡" in status:
+                    bg = "background-color: #fff4d6"
+                else:
+                    bg = "background-color: #edf7ed"
+                return [bg for _ in row]
+            return df.style.apply(_row_style, axis=1)
+
+        def _segment_label(r):
+            return f"{r['transaction']} · {r['segment']}" if "transaction" in r else r.get("type", "")
+
+        def _make_site_df(rows):
+            rows = [r for r in rows if _ent_match(r["entity"])]
+            rows = sorted(rows, key=lambda r: ({"alert": 0, "warn": 1, "ok": 2}.get(r["status"], 3), r["entity"]))
+            return pd.DataFrame([
+                {
+                    "Status": _status_icon(r["status"]),
+                    "Website": r["entity"],
+                    f"Listings {mshare.get('lm','M')}": fmt(r.get("listings")),
+                    f"Listings {mshare.get('pm','M-1')}": fmt(r.get("listings_prev")),
+                    "Listings MoM": _fmt_pct(r.get("listings_mom")),
+                    f"Share {mshare.get('lm','M')}": _fmt_share(r.get("ms_now")),
+                    f"Share {mshare.get('pm','M-1')}": _fmt_share(r.get("ms_prev")),
+                    "Share Δ": _fmt_pp(r.get("delta")),
+                    "Dedup denominator": fmt(r.get("dedup")),
+                    "Dedup MoM": _fmt_pct(r.get("dedup_mom")),
+                    "Reason": r.get("reason", "—"),
+                }
+                for r in rows
+            ])
+
+        def _make_attention_df(rows):
+            rows = [r for r in rows if r.get("status") in ("alert", "warn") and _ent_match(r["entity"])]
+            rows = sorted(rows, key=lambda r: ({"alert": 0, "warn": 1}.get(r["status"], 2), abs(r.get("delta") or 0)), reverse=False)
+            return pd.DataFrame([
+                {
+                    "Status": _status_icon(r["status"]),
+                    "Website": r["entity"],
+                    "Segment": _segment_label(r),
+                    "Listings MoM": _fmt_pct(r.get("listings_mom")),
+                    "Share Δ": _fmt_pp(r.get("delta")),
+                    f"Share {mshare.get('lm','M')}": _fmt_share(r.get("ms_now")),
+                    "Reason": r.get("reason", "—"),
+                }
+                for r in rows
+            ])
+
+        def _make_dedup_df(ddict, order):
+            table = []
+            for seg in order:
+                v = ddict.get(seg)
+                if not v:
+                    continue
+                table.append({
+                    "Segment": seg,
+                    f"Dedup {mshare.get('lm','M')}": fmt(v.get("now")),
+                    f"Dedup {mshare.get('pm','M-1')}": fmt(v.get("prev")),
+                    "Dedup MoM": _fmt_pct(v.get("mom")),
+                })
+            return pd.DataFrame(table)
+
+        all_rows = [r for r in (vl_rows + bt_rows) if _ent_match(r["entity"])]
+        n_alert_ms = sum(1 for r in all_rows if r["status"] == "alert")
+        n_warn_ms = sum(1 for r in all_rows if r["status"] == "warn")
+        active_websites = len(set(r["entity"] for r in all_rows))
+        inactive_hidden = sum(len(v) for v in mshare.get("inactive_vl", {}).values()) + sum(len(v) for v in mshare.get("inactive_type", {}).values())
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🔴 Alerts", n_alert_ms)
+        c2.metric("🟡 To review", n_warn_ms)
+        c3.metric("Active websites", active_websites)
+        c4.metric("Inactive rows hidden", inactive_hidden, help="Rows with no meaningful volume in the reference month are hidden from this Special check.")
+
+        st.divider()
+        st.markdown("#### 1) Deduplicated market denominator — MoM")
+        st.caption("This is the market denominator used for the share calculation. It is shown by segment, not only as one global ‘All’ value.")
+
+        dd_tab1, dd_tab2 = st.tabs(["Sales / Rentals", "Pro types"])
+        with dd_tab1:
+            ddvl = mshare.get("dedup_vl", {})
+            df_dd_vl = _make_dedup_df(ddvl, [
+                "Sales · All", "Sales · Pros", "Sales · Private",
+                "Rentals · All", "Rentals · Pros", "Rentals · Private",
+            ])
+            if not df_dd_vl.empty:
+                st.dataframe(df_dd_vl, use_container_width=True, hide_index=True)
+            else:
+                st.info("No Sales / Rentals denominator available.")
+        with dd_tab2:
+            ddt = mshare.get("dedup_type", {})
+            df_dd_t = _make_dedup_df(ddt, ["Agences", "Intermédiaires", "Notaires", "Autres"])
+            if not df_dd_t.empty:
+                st.dataframe(df_dd_t, use_container_width=True, hide_index=True)
+            else:
+                st.info("No Pro type denominator available.")
+
+        st.divider()
+        st.markdown("#### 2) Per-website MoM comparison")
+        st.caption("Pick one segment to see every active website with row colors: green = stable, yellow = review, red = alert.")
+
+        view = st.radio(
+            "Breakdown",
+            ["Sales / Rentals", "Pro types"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+        if view == "Sales / Rentals":
+            seg_order = ["Sales · All", "Sales · Pros", "Sales · Private", "Rentals · All", "Rentals · Pros", "Rentals · Private"]
+            available = sorted(set(f"{r['transaction']} · {r['segment']}" for r in vl_rows), key=lambda x: seg_order.index(x) if x in seg_order else 99)
+            if available:
+                selected_seg = st.selectbox("Segment", available, index=0)
+                selected_rows = [r for r in vl_rows if f"{r['transaction']} · {r['segment']}" == selected_seg]
+            else:
+                selected_seg = None
+                selected_rows = []
+        else:
+            type_order = ["Agences", "Intermédiaires", "Notaires", "Autres"]
+            available = sorted(set(r["type"] for r in bt_rows), key=lambda x: type_order.index(x) if x in type_order else 99)
+            if available:
+                selected_seg = st.selectbox("Pro type", available, index=0)
+                selected_rows = [r for r in bt_rows if r["type"] == selected_seg]
+            else:
+                selected_seg = None
+                selected_rows = []
+
+        df_site = _make_site_df(selected_rows)
+        if not df_site.empty:
+            st.dataframe(
+                _style_ms_table(df_site),
+                use_container_width=True,
+                hide_index=True,
+                height=min(560, 42 + 35 * len(df_site)),
+            )
+        else:
+            st.info("No active websites for this selection.")
+
+        inactive_map = mshare.get("inactive_vl", {}) if view == "Sales / Rentals" else mshare.get("inactive_type", {})
+        hidden_for_segment = inactive_map.get(selected_seg, []) if selected_seg else []
+        if hidden_for_segment:
+            st.caption(f"Hidden inactive website(s) for this segment: {', '.join(sorted(set(hidden_for_segment)))}")
+
+        st.divider()
+        st.markdown("#### 3) Rows needing attention")
+        attention_df = _make_attention_df(all_rows)
+        if not attention_df.empty:
+            st.dataframe(
+                _style_ms_table(attention_df),
+                use_container_width=True,
+                hide_index=True,
+                height=min(450, 42 + 35 * len(attention_df)),
+            )
+        else:
+            st.success("No significant month-over-month movements for the current selection.")
+
+        with st.expander("Optional: compact market-share matrix", expanded=False):
+            st.caption("Current market share with Δ vs previous month. This is secondary; the per-website table above is the main view.")
+            seg_order = [("Sales", "All"), ("Sales", "Pros"), ("Sales", "Private"),
+                         ("Rentals", "All"), ("Rentals", "Pros"), ("Rentals", "Private")]
+            seg_cols = [f"{t} · {s}" for t, s in seg_order]
+            ent_map = defaultdict(dict)
+            for r in vl_rows:
+                if not _ent_match(r["entity"]):
+                    continue
+                ent_map[r["entity"]][f"{r['transaction']} · {r['segment']}"] = r
+            matrix_rows = []
+            for ent in [s for s in SITES if s in ent_map]:
+                row = {"Website": ent}
+                for col in seg_cols:
+                    r = ent_map[ent].get(col)
+                    if r and r["ms_now"] is not None:
+                        icon = " 🔴" if r["status"] == "alert" else " 🟡" if r["status"] == "warn" else ""
+                        row[col] = f"{r['ms_now']:.1f}% ({r['delta']:+.1f}pp){icon}" if r["delta"] is not None else f"{r['ms_now']:.1f}%"
+                    else:
+                        row[col] = "—"
+                matrix_rows.append(row)
+            if matrix_rows:
+                st.dataframe(pd.DataFrame(matrix_rows), use_container_width=True, hide_index=True)
+
+        export = []
+        for r in vl_rows:
+            export.append({
+                "Breakdown": "Transaction×Segment",
+                "Entity": r["entity"],
+                "Segment": f"{r['transaction']} {r['segment']}",
+                "Listings M": r.get("listings"),
+                "Listings M-1": r.get("listings_prev"),
+                "Listings MoM %": round(r["listings_mom"], 2) if r.get("listings_mom") is not None else None,
+                "Dedup total M": r.get("dedup"),
+                "Dedup total M-1": r.get("dedup_prev"),
+                "Dedup MoM %": round(r["dedup_mom"], 2) if r.get("dedup_mom") is not None else None,
+                "Market share %": round(r["ms_now"], 2) if r.get("ms_now") is not None else None,
+                "Prev market share %": round(r["ms_prev"], 2) if r.get("ms_prev") is not None else None,
+                "Delta pp": round(r["delta"], 2) if r.get("delta") is not None else None,
+                "Status": r.get("status"),
+                "Reason": r.get("reason"),
+            })
+        for r in bt_rows:
+            export.append({
+                "Breakdown": "Pro type",
+                "Entity": r["entity"],
+                "Segment": r["type"],
+                "Listings M": r.get("listings"),
+                "Listings M-1": r.get("listings_prev"),
+                "Listings MoM %": round(r["listings_mom"], 2) if r.get("listings_mom") is not None else None,
+                "Dedup total M": r.get("dedup"),
+                "Dedup total M-1": r.get("dedup_prev"),
+                "Dedup MoM %": round(r["dedup_mom"], 2) if r.get("dedup_mom") is not None else None,
+                "Market share %": round(r["ms_now"], 2) if r.get("ms_now") is not None else None,
+                "Prev market share %": round(r["ms_prev"], 2) if r.get("ms_prev") is not None else None,
+                "Delta pp": round(r["delta"], 2) if r.get("delta") is not None else None,
+                "Status": r.get("status"),
+                "Reason": r.get("reason"),
+            })
+        if export:
+            st.download_button(
+                "⬇ Download Special check CSV",
+                pd.DataFrame(export).to_csv(index=False).encode("utf-8-sig"),
+                f"special_check_market_share_{mshare.get('lm','')}.csv",
+                "text/csv",
+            )
+
+
 # ═════════════ TRENDS ══════════════
 
 with tab2:
     tr=[r for r in trends if not site_filter or r["site"] in site_filter]
-    st.caption(
-        "MoM / YoY use the **reference month** (last Excel column). "
-        "Z-score avg = mean of up to **12 prior months**. "
-        "Sites with no volume in the reference month are **excluded** "
-        "(e.g. inactive AvendreAlouer)."
-    )
-    c1,c2,c3=st.columns(3)
+    n_inactive=sum(1 for r in tr if r["status"]=="inactive")
+    c1,c2,c3,c4=st.columns(4)
     c1.metric("🔴 Critical",sum(1 for r in tr if r["status"]=="alert"))
     c2.metric("🟡 Warnings",sum(1 for r in tr if r["status"]=="warn"))
-    c3.metric("Series monitored",len(tr))
+    c3.metric("Series monitored",len(tr)-n_inactive)
+    c4.metric("⚪ Inactive sites",n_inactive,help="Sites that stopped reporting — excluded from flags")
     sheet_sel=st.multiselect("Filter by sheet",sorted(set(r["sheet"] for r in tr)),
                               placeholder="All sheets",label_visibility="visible")
     if sheet_sel: tr=[r for r in tr if r["sheet"] in sheet_sel]
     flagged=[]; seen=set()
     for r in tr:
-        if r["status"] in ("alert","warn") and r["flags"]:
+        if r["status"] in ("alert","warn") and r["flags"] and r["status"]!="inactive":
             k=f"{r['site']}_{r['sheet']}"
             if k not in seen: seen.add(k); flagged.append(r)
     if flagged:
@@ -1331,14 +1761,29 @@ with tab2:
     else:
         st.success("No anomalies for current selection.")
     st.markdown("#### Full table")
-    tbl=[{"Status":"🔴" if r["status"]=="alert" else "🟡" if r["status"]=="warn" else "✅",
-          "Site":r["site"],"Sheet":r["sheet"],"Section":r["section"],
-          f"M ({r['lm']})":fmt(r["lv"]),f"M-1 ({r['pm']})":fmt(r["pv"]),
-          "Change M/M-1":f"{r['evol']:+.1f}%" if r["evol"] is not None else "—",
-          "Change M/Y-1":f"{r.get('evol_y1'):+.1f}%" if r.get("evol_y1") is not None else "—",
-          "Market share":f"{r['prm']:.1f}%" if r["prm"] is not None else "—",
-          "Notes":" · ".join(r["flags"]) if r["flags"] else "—"}
-         for r in sorted(tr,key=lambda x:{"alert":0,"warn":1,"ok":2}[x["status"]])]
+    def trend_status_icon(s):
+        return "🔴" if s=="alert" else "🟡" if s=="warn" else "⚪" if s=="inactive" else "✅"
+
+    def trend_label(r):
+        # Show meaningful data type label instead of raw sheet name
+        sec = r.get("section","")
+        sheet = r["sheet"]
+        if sec and sec not in (sheet, ""):
+            return f"{sec[:30]}"
+        return sheet[:30]
+
+    tbl=[{
+          "Status": trend_status_icon(r["status"]),
+          "Site":   r["site"],
+          "Data type": trend_label(r),
+          f"M ({r['lm']})":  fmt(r["lv"]),
+          f"M-1 ({r['pm']})": fmt(r["pv"]),
+          "M/M-1":  f"{r['evol']:+.1f}%" if r["evol"] is not None else "—",
+          "M/Y-1":  f"{r.get('evol_y1'):+.1f}%" if r.get("evol_y1") is not None else "—",
+          "Mkt share": f"{r['prm']:.1f}%" if r["prm"] is not None else "—",
+          "Notes": " · ".join(r["flags"]) if r["flags"] else ("Not reporting" if r["status"]=="inactive" else "—"),
+         }
+         for r in sorted(tr,key=lambda x:{"alert":0,"warn":1,"ok":2,"inactive":3}[x["status"]])]
     if tbl:
         df=pd.DataFrame(tbl)
         st.dataframe(df,use_container_width=True,hide_index=True,height=min(500,42+35*len(tbl)))
@@ -1350,10 +1795,8 @@ with tab2:
 with tab3:
     c1,c2,c3=st.columns(3)
     c1.metric("❌ Errors",n_err); c2.metric("⚠️ Warnings",n_warn); c3.metric("✅ Passed",n_ok)
-    st.caption(
-        "**Errors** = numbers don't match between files or sections. "
-        "**Warnings** = Z-score vs trailing ≤12 months (reference month only; inactive sites skipped)."
-    )
+    st.caption("**Errors** = numbers don't match between files or sections. "
+               "**Warnings** = statistically unusual change (Z-score).")
     st.divider()
     checks_show=checks
     if site_filter:
